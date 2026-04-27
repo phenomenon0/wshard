@@ -46,6 +46,9 @@ bf16 = [
     "ml-dtypes>=0.3",
 ]
 
+[project.scripts]
+wshard = "wshard.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/Neumenon/shard"
 Documentation = "https://github.com/Neumenon/shard/tree/main/wshard/py"
