@@ -186,6 +186,14 @@ shard.CreateWShard("episode.wshard", ep)
 ep, err := shard.OpenWShard("episode.wshard")
 ```
 
+## Performance
+
+Go reads a T=1000 episode (~21 MB raw) in ~6 ms (3.7 GB/s, memory-bandwidth limited).
+Python reads in ~4 ms; writes in ~30 ms (no compression) or ~36 ms (zstd).
+Header + index lookup alone takes ~12 µs, enabling 80,000+ index scans per second.
+
+See [`bench/`](bench/) for write/read benchmarks across compression types vs NumPy NPZ.
+
 ## Format
 
 64-byte header, 48-byte index entries, aligned data blocks. Built on the
@@ -301,9 +309,12 @@ packed = pack_residual_bits(residual)     # 2 bits per element
 
 ### Format conversion (experimental)
 
-Converters for DreamerV3 NPZ, Minari, and D4RL exist in `wshard.convert` but
-are **not yet covered by integration tests against real fixtures from those
-frameworks**. Treat as experimental and report breakage:
+Converters for DreamerV3 NPZ, Minari, and D4RL exist in `wshard.convert`.
+The DreamerV3 NPZ path (`load_dreamer` / `save_dreamer`) is now covered by
+integration tests (`py/tests/test_dreamer_roundtrip.py`) and verified
+byte-identical on synthetic fixtures. Minari and D4RL converters are **not
+yet covered by integration tests against real fixtures from those frameworks**;
+treat those paths as experimental and report breakage:
 
 ```python
 from wshard import load, save
