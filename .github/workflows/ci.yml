@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  wshard-python:
+    name: Python (3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        working-directory: py
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,bf16,hdf5]"
+          pip install build twine
+      - name: Test
+        working-directory: py
+        run: pytest -q tests/
+      - name: Build distribution
+        working-directory: py
+        run: |
+          python -m build
+          python -m twine check dist/*
+
+  wshard-typescript:
+    name: TypeScript (Node 20)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - name: Install
+        working-directory: js
+        run: npm ci
+      - name: Build
+        working-directory: js
+        run: npm run build
+      - name: Test
+        working-directory: js
+        run: npm test
+      - name: Pack (dry run)
+        working-directory: js
+        run: npm pack --dry-run
+
+  wshard-go:
+    name: Go (1.23)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: go/go.sum
+      - name: Build
+        working-directory: go
+        run: go build ./shard/...
+      - name: Vet
+        working-directory: go
+        run: go vet ./shard/...
+      - name: Test
+        working-directory: go
+        run: go test ./shard/...
+
+  wshard-golden:
+    name: Cross-language golden parity
+    runs-on: ubuntu-latest
+    needs: [wshard-python, wshard-typescript, wshard-go]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: golden/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - name: Regenerate golden fixtures
+        working-directory: golden
+        run: go run generate.go
+      - name: Detect golden drift
+        run: |
+          if ! git diff --quiet -- golden/; then
+            echo "::error::Golden fixtures changed after regeneration. Either commit the new files or pin compression library versions."
+            git diff --stat -- golden/
+            exit 1
+          fi
+      - name: Python interop tests
+        working-directory: py
+        run: |
+          pip install -e ".[dev,bf16]"
+          pytest -q tests/test_interop.py
+      - name: TypeScript interop tests
+        working-directory: js
+        run: |
+          npm ci
+          npm run build
+          npm test
