@@ -127,11 +127,11 @@ Time measured: wall time to open the file and fetch only the `action/ctrl` block
 
 | Format | File size | Median time | Min time |
 |--------|-----------|-------------|----------|
-| WShard (zstd) | 25.8 MB | 39 µs | 34 µs |
+| WShard (zstd) | 25.8 MB | 101 µs | 94 µs |
 | NPZ (deflate) | 23.8 MB | 194 µs | 189 µs |
 | HDF5 (gzip-4) | 22.7 MB | 255 µs | 251 µs |
 
-WShard achieves ~5× faster partial reads than NPZ and ~6.5× faster than HDF5 because:
+WShard reads only the requested channel ~2× faster than NPZ and ~2.5× faster than HDF5 because:
 - The index at the front of the file lets the reader seek directly to `action/ctrl` without
   reading or decompressing any other block.
 - NPZ is a ZIP file: `np.load` is lazy but must decompress only the matching member, which
@@ -140,13 +140,12 @@ WShard achieves ~5× faster partial reads than NPZ and ~6.5× faster than HDF5 b
   overhead are higher than WShard's flat sequential index.
 
 For Go, `BenchmarkPartialReadCtrl` shows ~20 µs for the same operation (WShard, zstd).
-Python overhead accounts for the ~15–20 µs difference versus Go.
+The Python figure includes Episode/Channel object construction; the underlying file IO
+itself is in the same single-digit-µs range.
 
-**API note:** The Python `load_wshard()` function does not currently expose a `channels=` filter
-for partial loading — it decodes the entire file. The partial-block benchmark above uses the
-internal index reader directly (`_wshard_read_block_partial`) to demonstrate the format's
-capability. A `channels=` argument is a planned enhancement (see TODO in wshard.py).
-In Go, `ReadEntryByName("action/ctrl")` on an open `ShardReader` is the clean public API.
+**API:** Python now exposes `load_wshard(path, channels=[...])` — when both a path and a
+channel allow-list are given, the loader streams only the requested blocks from disk.
+In Go, `ReadEntryByName("action/ctrl")` on an open `ShardReader` is the equivalent.
 
 ## Caveats
 

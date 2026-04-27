@@ -253,71 +253,21 @@ def build_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-# ── partial-block read helpers ─────────────────────────────────────────────────
+# ── partial-block read helper (public API) ────────────────────────────────────
 
-def _wshard_read_block_partial(path: str, block_name: str) -> bytes:
-    """Read a single named block from a wshard file without decoding others.
+def _wshard_read_block_partial(path: str, channel_id: str) -> bytes:
+    """Load only ``channel_id`` from a wshard file via the public ``channels=`` filter.
 
-    Uses the low-level index scan directly on the raw file so we touch only
-    the header + index + the one requested data block on disk.
+    All meta blocks plus the requested signal/action are decoded; everything
+    else is skipped, so this measures the same single-channel fetch path the
+    public API exposes.
     """
-    from wshard.wshard import (
-        HEADER_SIZE, INDEX_ENTRY_SIZE,
-        _parse_index_entry, compute_crc32,
-        BLOCK_FLAG_COMPRESSED, BLOCK_FLAG_ZSTD, BLOCK_FLAG_LZ4,
-    )
-    from wshard.compress import Compressor, compression_from_byte
-
-    with open(path, "rb") as fh:
-        # Read header
-        header = fh.read(HEADER_SIZE)
-        compression_default = compression_from_byte(header[9])
-        index_entry_size = struct.unpack("<H", header[10:12])[0]
-        entry_count = struct.unpack("<I", header[12:16])[0]
-        string_table_offset = struct.unpack("<Q", header[16:24])[0]
-        data_section_offset = struct.unpack("<Q", header[24:32])[0]
-
-        # Read full index
-        index_data = fh.read(entry_count * index_entry_size)
-
-        # Read string table
-        string_table_size = data_section_offset - string_table_offset
-        fh.seek(string_table_offset)
-        string_table = fh.read(string_table_size)
-
-        # Find the entry for block_name
-        for i in range(entry_count):
-            raw = index_data[i * index_entry_size:(i + 1) * index_entry_size]
-            entry = _parse_index_entry(raw)
-            name_offset = entry["name_offset"]
-            name_len = entry["name_len"]
-            if name_offset + name_len > len(string_table):
-                continue
-            name = string_table[name_offset:name_offset + name_len].decode("utf-8")
-            if name != block_name:
-                continue
-
-            # Seek directly to the block's data
-            fh.seek(entry["data_offset"])
-            block_data = fh.read(entry["disk_size"])
-
-            # Decompress if needed
-            entry_flags = entry["flags"]
-            orig_size = entry["orig_size"]
-            disk_size = entry["disk_size"]
-            if (entry_flags & BLOCK_FLAG_COMPRESSED) and disk_size != orig_size:
-                if entry_flags & BLOCK_FLAG_LZ4:
-                    comp_type = CompressionType.LZ4
-                elif entry_flags & BLOCK_FLAG_ZSTD:
-                    comp_type = CompressionType.ZSTD
-                else:
-                    comp_type = compression_default
-                decompressor = Compressor(comp_type)
-                block_data = decompressor.decompress(block_data, orig_size)
-
-            return block_data
-
-    raise KeyError(f"Block '{block_name}' not found in {path}")
+    ep = load_wshard(path, channels=[channel_id])
+    if channel_id in ep.actions:
+        return ep.actions[channel_id].data.tobytes()
+    if channel_id in ep.observations:
+        return ep.observations[channel_id].data.tobytes()
+    raise KeyError(f"Channel '{channel_id}' not found in {path}")
 
 
 def make_large_episode(rng: np.random.Generator) -> Episode:
@@ -403,7 +353,7 @@ def bench_partial_reads(tmpdir: str) -> str:
     times_wshard = []
     for _ in range(RUNS):
         t0 = time.perf_counter()
-        _ = _wshard_read_block_partial(wshard_path, "action/ctrl")
+        _ = _wshard_read_block_partial(wshard_path, "ctrl")
         times_wshard.append(time.perf_counter() - t0)
     ws_med, ws_min = _median_min(times_wshard)
     results.append(("WShard (zstd)", f"{wshard_sz/1e6:.1f} MB", ws_med, ws_min))
