@@ -29,7 +29,7 @@ pip install -e ".[dev]"
 
 python ../examples/write_cartpole.py
 python ../examples/read_cartpole.py examples/cartpole.wshard
-python ../examples/inspect_wshard.py examples/cartpole.wshard
+wshard inspect examples/cartpole.wshard      # CLI: also `wshard verify`, `convert`, `export`, `doctor`
 ```
 
 ## Why WShard?
@@ -343,10 +343,35 @@ converter requests. The most useful feedback right now:
 3. What benchmark would make this credible?
 4. Which converter should exist first: LeRobot, MCAP, RLDS, Minari, D4RL, or Zarr?
 
+## CLI
+
+After `pip install`, the `wshard` script is on PATH:
+
+```bash
+wshard inspect episode.wshard          # block list + dtype + shape + size
+wshard verify episode.wshard           # CRC32C check every block
+wshard convert input.npz output.wshard # auto-detect (DreamerV3 NPZ today)
+wshard export episode.wshard --format dreamer
+wshard doctor                          # version + dependency check
+```
+
+`python -m wshard ...` also works.
+
+## Web viewer
+
+A small browser-only viewer for `.wshard` files lives in [`viewer/`](viewer/).
+Drag a file in to see episode metadata + the block list (no decoding, no upload —
+parsing happens client-side). Build: `cd viewer && npm install && npm run build`.
+
 ## Docs
 
-- [Deep Dive](docs/DEEP_DIVE.md) — Format specification, architecture decisions.
-- [Security](SECURITY.md) — Threat model and reader hardening.
+- [Format at a glance](docs/FORMAT.md) — header, index, namespaces in 2 minutes.
+- [Deep Dive](docs/DEEP_DIVE.md) — full byte-level spec.
+- [FAQ](docs/FAQ.md) — common questions.
+- [Why not HDF5?](docs/WHY_NOT_HDF5.md) — honest comparison.
+- [Why not LeRobot?](docs/WHY_NOT_LEROBOT.md) — different layer, different problem.
+- [Security](SECURITY.md) — threat model and reader hardening.
+- [Benchmarks](bench/README.md) — write/read across formats and compressions.
 
 ## License
 

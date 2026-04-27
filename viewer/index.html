@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WShard Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #f5f5f5;
+      --surface:   #ffffff;
+      --border:    #d0d0d0;
+      --accent:    #3b6ef5;
+      --accent-bg: #eef1fd;
+      --text:      #1a1a1a;
+      --muted:     #666;
+      --alt:       #f9f9f9;
+      --badge:     #e4e4e4;
+      --badge-yes: #d4edda;
+      --badge-yes-text: #1a6630;
+      --radius:    6px;
+      --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    header h1 {
+      font-size: 17px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+    }
+
+    header .tagline {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .dot { color: var(--border); }
+
+    main {
+      max-width: 1100px;
+      margin: 32px auto;
+      padding: 0 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* ── Drop zone ─────────────────────────────────────────────── */
+
+    #drop-zone {
+      background: var(--surface);
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 48px 32px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      user-select: none;
+    }
+
+    #drop-zone:hover,
+    #drop-zone.drag-over {
+      border-color: var(--accent);
+      background: var(--accent-bg);
+    }
+
+    #drop-icon {
+      font-size: 40px;
+      margin-bottom: 12px;
+      line-height: 1;
+    }
+
+    #drop-label {
+      font-size: 15px;
+      font-weight: 500;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+
+    .drop-hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    #file-input { display: none; }
+
+    /* ── Error box ─────────────────────────────────────────────── */
+
+    #error-box {
+      background: #fff5f5;
+      border: 1px solid #f5c6cb;
+      border-radius: var(--radius);
+      padding: 14px 18px;
+      color: #721c24;
+      font-size: 13px;
+      font-family: var(--mono);
+    }
+
+    /* ── Section cards ─────────────────────────────────────────── */
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+    }
+
+    .card h2 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    .count {
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    /* ── Metadata table ────────────────────────────────────────── */
+
+    .meta-table {
+      border-collapse: collapse;
+      width: 100%;
+      max-width: 560px;
+    }
+
+    .meta-table th {
+      text-align: left;
+      font-weight: 500;
+      color: var(--muted);
+      padding: 5px 16px 5px 0;
+      width: 160px;
+      vertical-align: top;
+    }
+
+    .meta-table td {
+      padding: 5px 0;
+      color: var(--text);
+    }
+
+    /* ── Block table ───────────────────────────────────────────── */
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    .block-table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 13px;
+    }
+
+    .block-table thead th {
+      background: var(--alt);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 12px;
+      text-align: left;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .block-table thead th.sortable {
+      cursor: pointer;
+    }
+
+    .block-table thead th.sortable:hover {
+      background: var(--accent-bg);
+      color: var(--accent);
+    }
+
+    .block-table tbody td {
+      padding: 7px 12px;
+      border-bottom: 1px solid #ececec;
+      vertical-align: middle;
+    }
+
+    .block-table tbody tr.alt td {
+      background: var(--alt);
+    }
+
+    .block-table tbody tr:hover td {
+      background: var(--accent-bg);
+    }
+
+    .name-cell {
+      max-width: 280px;
+      word-break: break-all;
+    }
+
+    .ns-cell {
+      color: var(--muted);
+    }
+
+    /* ── Shared helpers ────────────────────────────────────────── */
+
+    .mono { font-family: var(--mono); font-size: 12px; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 10px;
+      font-size: 11px;
+      background: var(--badge);
+      color: var(--muted);
+    }
+
+    .badge-yes {
+      background: var(--badge-yes);
+      color: var(--badge-yes-text);
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WShard Viewer</h1>
+    <span class="dot">·</span>
+    <span class="tagline">structural overview — no tensor decoding</span>
+  </header>
+
+  <main>
+    <div id="drop-zone">
+      <div id="drop-icon">📂</div>
+      <div id="drop-label">Drop a .wshard file here — or click to browse</div>
+      <div class="drop-hint">Reads header, index, and JSON metadata blocks only &nbsp;·&nbsp; stays 100% client-side</div>
+    </div>
+
+    <input type="file" id="file-input" accept=".wshard">
+
+    <div id="error-box" class="hidden"></div>
+
+    <div id="meta-section" class="card hidden"></div>
+    <div id="block-section" class="card hidden"></div>
+  </main>
+
+  <script type="module" src="dist/viewer.js"></script>
+</body>
+</html>
