@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WShard — one-file episodes for robots, RL, and world models</title>
+<meta name="description" content="WShard is a small, neutral binary file format for trajectory data: one .wshard file = one episode, with per-block compression and cross-language readers in Python, TypeScript, and Go.">
+<meta name="theme-color" content="#0c0a14">
+<style>
+  :root {
+    --bg:        #0c0a14;
+    --bg-soft:   #14101e;
+    --bg-card:   #1a1626;
+    --fg:        #e9e3f7;
+    --fg-soft:   #b6acd0;
+    --fg-mute:   #8a7ea8;
+    --line:      #2a223a;
+    --accent:    #c9a8ff;
+    --accent-2:  #f7c873;
+    --code-bg:   #100c1c;
+    --code-fg:   #e6dcff;
+    --maxw:      820px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: radial-gradient(ellipse at top, #1a132c 0%, var(--bg) 60%);
+    color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; transition: border-color .15s; }
+  a:hover { border-bottom-color: var(--accent); }
+
+  code, pre, kbd { font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { background: var(--code-bg); color: var(--code-fg); padding: .12em .35em; border-radius: 4px; font-size: .92em; }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 1rem 1.1rem;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    overflow-x: auto;
+    font-size: .9em;
+    line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; color: inherit; }
+
+  /* hero */
+  .hero {
+    padding: 4rem 1.5rem 2.5rem;
+    text-align: center;
+    border-bottom: 1px solid var(--line);
+    background:
+      radial-gradient(900px 360px at 50% -120px, rgba(201, 168, 255, 0.12), transparent),
+      radial-gradient(600px 220px at 50% -60px, rgba(247, 200, 115, 0.08), transparent);
+  }
+  .hero .brand {
+    font-size: 13px;
+    letter-spacing: .25em;
+    text-transform: uppercase;
+    color: var(--fg-mute);
+    margin-bottom: 1rem;
+  }
+  .hero h1 {
+    font-size: clamp(2.4rem, 4.4vw, 3.4rem);
+    margin: 0 0 .8rem;
+    background: linear-gradient(160deg, #fff 0%, var(--accent) 60%, var(--accent-2) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    letter-spacing: -.02em;
+  }
+  .hero .tagline { font-size: 1.18rem; color: var(--fg-soft); max-width: 640px; margin: 0 auto; }
+  .hero .cta {
+    margin-top: 2rem;
+    display: inline-flex;
+    gap: .6rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .hero .cta a {
+    display: inline-block;
+    padding: .65rem 1.1rem;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--bg-card);
+    color: var(--fg);
+    font-size: .95rem;
+  }
+  .hero .cta a.primary {
+    background: linear-gradient(160deg, var(--accent) 0%, #9a7eff 100%);
+    color: #0c0716;
+    border-color: transparent;
+    font-weight: 600;
+  }
+  .hero .cta a:hover { border-bottom-color: transparent; transform: translateY(-1px); }
+
+  /* status pill */
+  .badges { margin-top: 1.4rem; display: inline-flex; gap: .4rem; flex-wrap: wrap; justify-content: center; }
+  .pill {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--fg-soft);
+    font-size: .78rem;
+    background: var(--bg-soft);
+  }
+  .pill.beta { color: var(--accent-2); border-color: rgba(247, 200, 115, 0.3); }
+
+  /* readme content */
+  main {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 3rem 1.5rem 6rem;
+  }
+
+  .readme h1 { font-size: 2rem; margin-top: 3.5rem; padding-top: 1rem; border-top: 1px solid var(--line); letter-spacing: -.01em; }
+  .readme h1:first-child { display: none; }   /* hide top README "WShard" — hero already says it */
+  .readme h2 { font-size: 1.5rem; margin-top: 2.6rem; letter-spacing: -.005em; }
+  .readme h3 { font-size: 1.18rem; margin-top: 2rem; color: var(--fg); }
+  .readme h2, .readme h3 {
+    background: linear-gradient(90deg, var(--fg) 0%, var(--accent) 220%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .readme p { color: var(--fg-soft); }
+  .readme strong { color: var(--fg); }
+  .readme em { color: var(--fg-soft); }
+  .readme blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 1rem 0;
+    padding: .25rem 1rem;
+    color: var(--fg-soft);
+    background: var(--bg-soft);
+    border-radius: 0 6px 6px 0;
+  }
+  .readme ul, .readme ol { color: var(--fg-soft); padding-left: 1.4rem; }
+  .readme li { margin: .25rem 0; }
+  .readme li::marker { color: var(--accent); }
+
+  .readme table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: .92rem;
+    background: var(--bg-card);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .readme th, .readme td {
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    vertical-align: top;
+  }
+  .readme th { background: var(--bg-soft); color: var(--fg); font-weight: 600; }
+  .readme tr:last-child td { border-bottom: none; }
+
+  .readme hr { border: none; border-top: 1px solid var(--line); margin: 2.5rem 0; }
+
+  .readme img { max-width: 100%; }
+
+  /* footer */
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 2rem 1.5rem 3rem;
+    text-align: center;
+    color: var(--fg-mute);
+    font-size: .88rem;
+  }
+  footer a { color: var(--fg-soft); }
+
+  /* hash anchor target */
+  :target { scroll-margin-top: 1rem; }
+
+  @media (max-width: 600px) {
+    .hero { padding: 3rem 1rem 2rem; }
+    main { padding: 2rem 1.1rem 4rem; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="brand">W · S · H · A · R · D</div>
+  <h1>One file. One episode.<br>Three languages.</h1>
+  <p class="tagline">A small, neutral binary format for trajectory data — robots, RL, world models. Per-block compression, byte-aligned reads, and verified parity across Python, TypeScript, and Go.</p>
+  <div class="cta">
+    <a class="primary" href="https://github.com/phenomenon0/wshard">View on GitHub →</a>
+    <a href="#try-it-in-60-seconds">60-second quick-start</a>
+    <a href="MARKET_RELEASE.html">Launch announcement</a>
+  </div>
+  <div class="badges">
+    <span class="pill beta">Status: Beta</span>
+    <span class="pill">MIT-licensed</span>
+    <span class="pill">Python · TypeScript · Go</span>
+  </div>
+</header>
+
+<main>
+  <article id="readme" class="readme"><!-- README rendered here --></article>
+</main>
+
+<footer>
+  <div>WShard — MIT licensed. <a href="https://github.com/phenomenon0/wshard">phenomenon0/wshard</a></div>
+  <div style="margin-top:.4rem;">Built for the Show HN launch. <a href="MARKET_RELEASE.html">Read the release.</a></div>
+</footer>
+
+<!-- Markdown source (kept inline so the page works offline) -->
+<script id="readme-src" type="text/markdown">
+# WShard
+
+One-file episodes for robots, RL, and world models.
+
+A `.wshard` file stores one episode: observations, actions, rewards, done
+flags, metadata, and optional model prediction / uncertainty / residual
+lanes. Each block is independently addressable and independently
+compressed.
+
+```
+episode.wshard
+├── meta/episode      → {"episode_id": "ep_001", "env_id": "Manip-v2", "length_T": 500}
+├── signal/rgb        → [500, 84, 84, 3] uint8     (zstd compressed)
+├── signal/joint_pos  → [500, 7] float32           (uncompressed, 32-byte aligned)
+├── action/ctrl       → [500, 7] float32
+├── reward            → [500] float32
+├── done              → [500] bool
+├── omen/joint_pos/dreamer    → [500, 7] float32   (model predictions)
+├── uncert/joint_pos/std      → [500, 7] float32   (uncertainty)
+└── residual/joint_pos/sign2nddiff → packed bits   (residual encoding)
+```
+
+## Try it in 60 seconds
+
+```bash
+git clone https://github.com/phenomenon0/wshard
+cd wshard/py
+pip install -e ".[dev]"
+
+python ../examples/write_cartpole.py
+python ../examples/read_cartpole.py examples/cartpole.wshard
+wshard inspect examples/cartpole.wshard      # CLI: also `wshard verify`, `convert`, `export`, `doctor`
+```
+
+## Why WShard?
+
+Robotics and RL trajectory data has several good ecosystems already, but no
+small neutral file format focused specifically on **self-contained tensor
+episodes plus world-model prediction lanes**. WShard tries to fill that
+narrow gap:
+
+- **One file = one episode.** Move it, archive it, mmap it, ship it across a network — the file is the unit of work.
+- **Per-block compression.** Zstd the video, leave the reward vector raw.
+- **Fast name lookup.** Index entries carry an xxHash64 of the block name, so finding `signal/joint_pos` is a quick scan over fixed-size index slots, no string-table parse, no full deserialization.
+- **32-byte aligned data.** Read with `mmap()` + pointer cast for low-copy reads.
+- **CRC32C checksums.** Hardware-accelerated integrity per block.
+- **Streaming append.** `.partial` file pattern for crash-safe live recording.
+- **Cross-language.** Python, TypeScript, and Go readers/writers from one spec.
+
+## What WShard is not
+
+WShard is not a database. It is not a training framework. It is not a
+replacement for LeRobot, MCAP, Zarr, HDF5, or Parquet.
+
+| When you want… | Reach for… |
+|---|---|
+| Hugging Face Hub-hosted robotics datasets | LeRobot (Parquet + MP4) |
+| Timestamped pub/sub robot logs | MCAP |
+| Chunked N-dimensional arrays on cloud storage | Zarr |
+| Mature scientific array storage | HDF5 |
+| Self-contained episode files with named tensor blocks **and** world-model lanes | WShard |
+
+WShard complements these formats. We provide bridges where it makes sense.
+
+## Install
+
+These are git-install commands. Registry packages on PyPI / npm will follow
+once the format and API stabilize.
+
+```bash
+# Python
+pip install "git+https://github.com/phenomenon0/wshard.git#subdirectory=py"
+
+# TypeScript (clone + build is the most reliable path today)
+git clone https://github.com/phenomenon0/wshard
+cd wshard/js && npm ci && npm run build
+
+# Go
+go get github.com/phenomenon0/wshard/go@latest
+```
+
+## Quick Start
+
+### Python
+
+```python
+from wshard import load_wshard, save_wshard
+from wshard.types import Episode, Channel, DType
+import numpy as np
+
+# Read
+ep = load_wshard("episode.wshard")
+print(ep.id, ep.env_id, ep.length)
+obs = ep.observations["joint_pos"].data   # np.ndarray [T, 7]
+act = ep.actions["ctrl"].data             # np.ndarray [T, 7]
+
+# Read only one channel (streams just that block from disk)
+ep_small = load_wshard("episode.wshard", channels=["ctrl"])
+
+# Write
+ep = Episode(id="ep_001", length=100)
+ep.env_id = "ManipulationEnv-v2"
+ep.observations["joint_pos"] = Channel(
+    name="joint_pos", dtype=DType.FLOAT32,
+    shape=[7], data=np.random.randn(100, 7).astype(np.float32),
+)
+ep.actions["ctrl"] = Channel(
+    name="ctrl", dtype=DType.FLOAT32,
+    shape=[7], data=np.random.randn(100, 7).astype(np.float32),
+)
+ep.rewards = Channel(name="reward", dtype=DType.FLOAT32, data=np.zeros(100, dtype=np.float32))
+save_wshard(ep, "episode.wshard", compression="zstd")
+```
+
+### Streaming (live recording)
+
+```python
+from wshard.streaming import WShardStreamWriter
+
+channels = [
+    {"id": "joint_pos", "dtype": "f32", "shape": [7]},
+    {"id": "ctrl", "dtype": "f32", "shape": [7]},
+]
+
+with WShardStreamWriter("recording.wshard", "ep_001", channels) as w:
+    w.begin_episode()
+    for t in range(1000):
+        obs, reward, done = env.step(action)
+        w.write_timestep({"joint_pos": obs, "ctrl": action}, reward=reward, done=done)
+    w.end_episode()  # atomic rename from .partial
+```
+
+### TypeScript
+
+```typescript
+import { WShardWriter, WShardReader } from '@wshard/core';
+
+// Write
+const writer = new WShardWriter('episode.wshard', { compression: 'lz4' });
+writer
+  .setEpisode({ episode_id: 'ep_001', length_t: 100, env_id: 'MyEnv-v0' })
+  .addChannel({ id: 'state', dtype: 'f32', shape: [4] })
+  .setSignalFloat32_2D('state', observations)
+  .setActionFloat32_2D('ctrl', actions)
+  .setReward(rewards)
+  .setDone(doneFlags);
+await writer.write();
+
+// Read
+const reader = new WShardReader('episode.wshard');
+await reader.open();
+const obs = await reader.getSignalFloat32_2D('state', 4);
+const act = await reader.getActionFloat32_2D('ctrl', 2);
+await reader.close();
+```
+
+### Go
+
+```go
+import "github.com/phenomenon0/wshard/go/shard"
+
+// Write
+ep := &shard.WShardEpisode{
+    ID:      "ep_001",
+    EnvID:   "ManipulationEnv-v2",
+    LengthT: 100,
+    Observations: map[string]*shard.WShardChannel{
+        "joint_pos": {Name: "joint_pos", DType: "f32", Shape: []int{7}, Data: jointBytes},
+    },
+    Actions: map[string]*shard.WShardChannel{
+        "ctrl": {Name: "ctrl", DType: "f32", Shape: []int{7}, Data: ctrlBytes},
+    },
+    Rewards: rewards,
+}
+shard.CreateWShard("episode.wshard", ep)
+
+// Read
+ep, err := shard.OpenWShard("episode.wshard")
+```
+
+## Performance
+
+Go reads a T=1000 episode (~21 MB raw) in ~6 ms (3.7 GB/s, memory-bandwidth limited).
+Python reads in ~4 ms; writes in ~30 ms (no compression) or ~36 ms (zstd).
+Header + index lookup alone takes ~12 µs, enabling 80,000+ index scans per second.
+
+Single-channel partial fetch from a 50 MB file:
+**WShard 101 µs vs NPZ 194 µs vs HDF5 255 µs.**
+
+See [bench/](https://github.com/phenomenon0/wshard/tree/main/bench) for write/read benchmarks across compression types vs NumPy NPZ, HDF5, and Parquet.
+
+## Format
+
+64-byte header, 48-byte index entries, aligned data blocks. Built on the
+Shard container (role `0x05`).
+
+```
+[Header 64B] [Index N×48B] [String Table] [Padding] [Data Blocks...]
+```
+
+Block names are hierarchical paths:
+
+| Prefix | Content |
+|--------|---------|
+| `meta/` | JSON metadata (`meta/wshard`, `meta/episode`, `meta/channels`) |
+| `signal/` | Observation tensors |
+| `action/` | Action tensors |
+| `time/` | Timestamps (`time/ticks`, `time/timestamps_ns`) |
+| `omen/` | Model prediction tensors |
+| `uncert/` | Uncertainty estimates |
+| `residual/` | Compressed residual encodings |
+| `reward` | Reward signal (float32) |
+| `done` | Termination flags (bool) |
+
+13 data types: `f32`, `f64`, `f16`, `bf16`, `i64`, `i32`, `i16`, `i8`, `u64`, `u32`, `u16`, `u8`, `bool`.
+
+Compression: none, zstd, or lz4 — per block. Checksums: CRC32C (Castagnoli).
+
+See [docs/DEEP_DIVE.md](https://github.com/phenomenon0/wshard/blob/main/docs/DEEP_DIVE.md) for the byte-level spec.
+
+## Cross-language parity
+
+All three implementations produce identical binary output for the same
+input. Verified by golden-file tests:
+
+- Go generates reference `.wshard` files (`golden/generate.go`)
+- Python and TypeScript read them and assert byte-level correctness
+- CRC32C, xxHash64, dtype sizes, and block layout are checked against committed reference values (`golden/golden_hashes.json`)
+
+```
+CRC32C("hello")          = 0x9a71bb4c
+xxHash64("signal/obs")   = 0x86f8c8413116a0ae
+```
+
+## Status
+
+**Beta.** The format is stable enough to try, but we are still looking for
+feedback on schemas, video blocks, and converters. The Show HN launch is
+intentional — the goal is to find sharp edges before declaring 1.0.
+
+## Known limitations
+
+- **No native video block type.** Camera data is stored as raw tensors. H.264 / H.265 / AV1 block types are future work.
+- **No Arrow / Polars / DuckDB integration** yet.
+- **No formal schema registry** — block-name conventions are advisory.
+- **Cloud / object-store behavior** has not been stress-tested.
+- **Few external users** so far. The launch is the bug-finding pass.
+
+## CLI
+
+After `pip install`, the `wshard` script is on PATH:
+
+```bash
+wshard inspect episode.wshard          # block list + dtype + shape + size
+wshard verify episode.wshard           # CRC32C check every block
+wshard convert input.npz output.wshard # auto-detect (DreamerV3 NPZ today)
+wshard export episode.wshard --format dreamer
+wshard doctor                          # version + dependency check
+```
+
+`python -m wshard ...` also works.
+
+## Web viewer
+
+A small browser-only viewer for `.wshard` files lives in [viewer/](https://github.com/phenomenon0/wshard/tree/main/viewer).
+Drag a file in to see episode metadata + the block list (no decoding, no upload —
+parsing happens client-side). Build: `cd viewer && npm install && npm run build`.
+
+## Docs
+
+- [Format at a glance](https://github.com/phenomenon0/wshard/blob/main/docs/FORMAT.md) — header, index, namespaces in 2 minutes.
+- [Deep Dive](https://github.com/phenomenon0/wshard/blob/main/docs/DEEP_DIVE.md) — full byte-level spec.
+- [FAQ](https://github.com/phenomenon0/wshard/blob/main/docs/FAQ.md) — common questions.
+- [Why not HDF5?](https://github.com/phenomenon0/wshard/blob/main/docs/WHY_NOT_HDF5.md) — honest comparison.
+- [Why not LeRobot?](https://github.com/phenomenon0/wshard/blob/main/docs/WHY_NOT_LEROBOT.md) — different layer, different problem.
+- [Security](https://github.com/phenomenon0/wshard/blob/main/SECURITY.md) — threat model and reader hardening.
+- [Benchmarks](https://github.com/phenomenon0/wshard/blob/main/bench/README.md) — write/read across formats and compressions.
+
+## Contributing
+
+Open issues for broken readers, bad benchmarks, malformed files, or
+converter requests. The most useful feedback right now:
+
+1. What format do you use today?
+2. Where would WShard break in your pipeline?
+3. What benchmark would make this credible?
+4. Which converter should exist first: LeRobot, MCAP, RLDS, Minari, D4RL, or Zarr?
+
+## License
+
+MIT.
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" defer></script>
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const src = document.getElementById('readme-src').textContent;
+    marked.use({ gfm: true, breaks: false });
+    document.getElementById('readme').innerHTML = marked.parse(src);
+
+    // Add anchor ids to headings
+    document.querySelectorAll('#readme h1, #readme h2, #readme h3').forEach(h => {
+      const id = h.textContent.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      if (id) h.id = id;
+    });
+  });
+</script>
+
+</body>
+</html>

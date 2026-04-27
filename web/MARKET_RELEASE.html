@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WShard 0.1 — Show HN release</title>
+<meta name="description" content="WShard 0.1 launch announcement — one binary file format for self-contained tensor episodes plus world-model lanes, with verified parity across Python, TypeScript, and Go.">
+<meta name="theme-color" content="#0c0a14">
+<link rel="canonical" href="MARKET_RELEASE.html">
+<style>
+  :root {
+    --bg:        #0c0a14;
+    --bg-soft:   #14101e;
+    --bg-card:   #1a1626;
+    --fg:        #e9e3f7;
+    --fg-soft:   #b6acd0;
+    --fg-mute:   #8a7ea8;
+    --line:      #2a223a;
+    --accent:    #c9a8ff;
+    --accent-2:  #f7c873;
+    --code-bg:   #100c1c;
+    --code-fg:   #e6dcff;
+    --maxw:      780px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: radial-gradient(ellipse at top, #1a132c 0%, var(--bg) 60%);
+    color: var(--fg);
+    font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; transition: border-color .15s; }
+  a:hover { border-bottom-color: var(--accent); }
+  code, pre { font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { background: var(--code-bg); color: var(--code-fg); padding: .12em .35em; border-radius: 4px; font-size: .92em; }
+  pre {
+    background: var(--code-bg); color: var(--code-fg);
+    padding: 1rem 1.1rem; border-radius: 8px;
+    border: 1px solid var(--line); overflow-x: auto;
+    font-size: .9em; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; }
+
+  .topbar {
+    border-bottom: 1px solid var(--line);
+    padding: 1rem 1.5rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-soft);
+  }
+  .topbar a { color: var(--fg-soft); font-size: .92rem; }
+  .topbar .home { color: var(--accent); font-weight: 600; letter-spacing: .12em; }
+
+  main {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 3rem 1.5rem 6rem;
+  }
+  .release-tag {
+    display: inline-block;
+    padding: .2rem .6rem;
+    border-radius: 999px;
+    background: rgba(247, 200, 115, 0.12);
+    border: 1px solid rgba(247, 200, 115, 0.3);
+    color: var(--accent-2);
+    font-size: .78rem;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    margin-bottom: 1rem;
+  }
+  h1 {
+    font-size: clamp(2rem, 4vw, 2.8rem);
+    margin: .2rem 0 .8rem;
+    letter-spacing: -.02em;
+    background: linear-gradient(160deg, #fff 0%, var(--accent) 60%, var(--accent-2) 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  h2 {
+    font-size: 1.5rem; margin-top: 2.6rem;
+    background: linear-gradient(90deg, var(--fg) 0%, var(--accent) 220%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  h3 { font-size: 1.15rem; margin-top: 1.8rem; }
+  p, li { color: var(--fg-soft); }
+  strong { color: var(--fg); }
+  blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 1rem 0;
+    padding: .25rem 1rem;
+    color: var(--fg-soft);
+    background: var(--bg-soft);
+    border-radius: 0 6px 6px 0;
+    font-style: italic;
+  }
+  ul, ol { padding-left: 1.4rem; }
+  li::marker { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--line); margin: 2.5rem 0; }
+  table {
+    width: 100%; border-collapse: collapse; margin: 1rem 0;
+    font-size: .92rem; background: var(--bg-card);
+    border-radius: 8px; overflow: hidden;
+  }
+  th, td { padding: .55rem .8rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { background: var(--bg-soft); color: var(--fg); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+
+  .meta { color: var(--fg-mute); font-size: .9rem; margin-bottom: 1.2rem; }
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 2rem 1.5rem 3rem;
+    text-align: center;
+    color: var(--fg-mute);
+    font-size: .88rem;
+  }
+  footer a { color: var(--fg-soft); }
+
+  @media (max-width: 600px) {
+    main { padding: 2rem 1.1rem 4rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <a class="home" href="index.html">← W·SHARD</a>
+  <a href="https://github.com/phenomenon0/wshard">GitHub</a>
+</div>
+
+<main id="release"><!-- markdown rendered here --></main>
+
+<footer>
+  <div>WShard — MIT licensed. <a href="https://github.com/phenomenon0/wshard">phenomenon0/wshard</a></div>
+</footer>
+
+<!-- Markdown source kept inline so the page works offline -->
+<script id="release-src" type="text/markdown">
+<span class="release-tag">Release · 0.1 · April 2026</span>
+
+# WShard 0.1 — One file. One episode. Three languages.
+
+<p class="meta">Show HN release announcement · April 2026</p>
+
+> A small, neutral binary file format for trajectory data — robots, RL,
+> world-model lanes — with verified parity across Python, TypeScript, and Go.
+> MIT-licensed. Beta. We are looking for sharp edges.
+
+---
+
+## The 30-second pitch
+
+If you train robots, run RL agents, or build world models, you produce the
+same shape of data: time-indexed observations, actions, rewards, terminations,
+sometimes camera frames, sometimes proprioception, sometimes model
+predictions. Today that data lives in HDF5, NPZ, RLDS, LeRobot's Parquet+MP4,
+MCAP, Zarr, or a lab-specific custom format. Each is great at what it was
+built for. None was built for **self-contained tensor episodes plus
+world-model prediction lanes**, written and read identically from Python,
+TypeScript, and Go.
+
+That's the gap WShard fills. Not "yet another format." A **small, focused**
+format for one specific shape of problem.
+
+---
+
+## What's in 0.1
+
+| Capability | Status |
+|---|---|
+| Python reader / writer | beta, 139 tests passing |
+| TypeScript reader / writer | beta, 15 tests passing |
+| Go reader / writer | beta, full test coverage |
+| Cross-language byte-parity | verified by golden-file CI |
+| Per-block compression (none / zstd / lz4) | yes |
+| CRC32C integrity per block | yes |
+| Streaming append (`.partial` → atomic rename) | yes |
+| Chunked episodes with continuity validation | yes |
+| Single-channel partial reads | yes — `load_wshard(path, channels=[…])` |
+| Multi-modal observation lanes (RGB / depth / proprio / language) | yes |
+| Residual encoding (sign-of-2nd-difference, 2 bits/element) | experimental |
+| CLI (`wshard inspect / verify / convert / export / doctor`) | yes |
+| Browser-only viewer (drag a file, see the block layout) | yes |
+| Converters: DreamerV3 NPZ ⇄ WShard | round-trip tested |
+| Converters: Minari, D4RL, LeRobot bridges | exist, **not** integration-tested yet |
+| H.264 / H.265 / AV1 video block type | **future work** |
+| Arrow / Polars / DuckDB integration | **future work** |
+| Formal schema registry | **future work** — block-name conventions are advisory today |
+| PyPI / npm publishes | **deferred** until format and API stabilize |
+
+---
+
+## Numbers we're willing to defend
+
+These come from `bench/` in the repo. All single-machine, x86_64, NVMe,
+warm cache where noted.
+
+**Full-episode read** (T=1000, ~21 MB raw, 84×84×3 RGB + joint pos + ctrl + reward + done):
+
+| Format          | Read time |
+|-----------------|-----------|
+| WShard (no compression) | ~6 ms (Go) / ~4 ms (Python) |
+| WShard (zstd)           | ~28 ms (Python) |
+| HDF5 (deflate)          | ~100 ms (Python) |
+| NumPy NPZ (deflate)     | ~94 ms (Python) |
+| Parquet (LeRobot-style) | ~67 ms (Python) |
+
+**Single-channel partial fetch** (one 28 KB action block from a 50 MB file,
+public API only, no internal helpers):
+
+| Format            | Median time |
+|-------------------|-------------|
+| **WShard (zstd)** | **101 µs** |
+| NPZ (deflate)     | 194 µs |
+| HDF5 (gzip-4)     | 255 µs |
+
+**Streaming append**: per-step write cost is ~25 µs. Crash-safe by virtue of
+the `.partial` file pattern — episodes either finalize via atomic rename or
+remain visibly unfinished.
+
+We are not claiming WShard is fastest at everything. We are claiming it is
+fast at the things you do most when iterating on RL or world-model training:
+seek to one block, read a whole episode end-to-end, append timesteps live.
+
+---
+
+## What WShard is not
+
+- Not a database.
+- Not a training framework.
+- Not a replacement for HDF5, LeRobot, MCAP, Zarr, or Parquet.
+- Not a publishing format for HuggingFace Hub (use LeRobot for that).
+- Not a pub/sub message bus (use MCAP for that).
+
+WShard is a **layer**: the binary file your training loop loads, your
+recorder writes, and your dashboard parses. Bridges to the layers above and
+below already exist or are in progress.
+
+| When you want…                                | Reach for… |
+|-----------------------------------------------|------------|
+| HuggingFace-Hub-hosted robotics datasets      | LeRobot |
+| Timestamped pub/sub robot logs                | MCAP |
+| Chunked N-dim arrays in cloud object storage  | Zarr |
+| Mature scientific array storage               | HDF5 |
+| Self-contained episode files **with** world-model lanes | WShard |
+
+---
+
+## Format at a glance
+
+```
+[Header 64 B] [Index N×48 B] [String Table] [Padding] [Data Blocks…]
+```
+
+- **Header**: magic (`SHRD`), version, role (`0x05` = WShard), alignment,
+  default compression, entry count, offsets.
+- **Index entry (48 B)**: name offset/length, xxHash64 of name, data offset,
+  on-disk size, original size, dtype, shape rank, flags, CRC32C.
+- **Block names** are hierarchical paths:
+  - `meta/wshard`, `meta/episode`, `meta/channels` — JSON metadata
+  - `signal/<id>` — observation tensors
+  - `action/<id>` — action tensors
+  - `time/ticks`, `time/timestamps_ns` — temporal axis
+  - `omen/<id>/<model>` — model predictions
+  - `uncert/<id>/<kind>` — uncertainty estimates
+  - `residual/<id>/<kind>` — packed residual encodings
+  - `reward`, `done` — scalar tracks
+
+Per-block compression is decoded from the index entry, not the header — so a
+file can mix raw and compressed blocks freely. Data blocks are 32-byte
+aligned: read with `mmap()` + cast for low-copy access.
+
+The full byte-level spec is in [docs/DEEP_DIVE.md](https://github.com/phenomenon0/wshard/blob/main/docs/DEEP_DIVE.md).
+
+---
+
+## Honest about edges
+
+This is a beta launch. We expect to find bugs. The biggest unknowns:
+
+1. **Object stores.** S3/GCS/Azure haven't been stress-tested. WShard is a
+   single file with a header at offset 0 — should be fine for HTTP range
+   requests, but we haven't measured.
+2. **Schema drift.** Block names are conventions, not contracts. If two labs
+   call their joint angles `joint_pos` and `q`, today nothing flags that.
+3. **Video.** RGB is currently raw uint8. Adding native H.264/H.265/AV1
+   block types is the most-requested item we know about. It will land in
+   0.2 if the launch produces clear demand.
+4. **Cross-language quirks.** xxHash64 in WASM (TypeScript) is a recent fix.
+   We caught it because golden-file CI compares hashes byte-for-byte. We
+   don't believe other parity gaps remain — but this is exactly the kind of
+   issue an external user reproduces in five minutes.
+
+---
+
+## The ask
+
+If you build, train on, or ship trajectory data:
+
+1. **Try WShard against your own data.**
+   `pip install "git+https://github.com/phenomenon0/wshard.git#subdirectory=py"`
+2. **Tell us where it breaks.** Schema, throughput, cloud, converters,
+   API ergonomics — all in scope. [Open an issue.](https://github.com/phenomenon0/wshard/issues)
+3. **Tell us which converter should exist next.** LeRobot? MCAP? RLDS?
+   Minari? D4RL? Zarr? We will build the most-asked-for one first.
+
+We're not trying to win. We're trying to find out whether a small, neutral
+episode format is something anyone other than us actually needs.
+
+---
+
+## Links
+
+- **Code**: <https://github.com/phenomenon0/wshard>
+- **Spec**: [docs/DEEP_DIVE.md](https://github.com/phenomenon0/wshard/blob/main/docs/DEEP_DIVE.md)
+- **Format crash course**: [docs/FORMAT.md](https://github.com/phenomenon0/wshard/blob/main/docs/FORMAT.md)
+- **FAQ**: [docs/FAQ.md](https://github.com/phenomenon0/wshard/blob/main/docs/FAQ.md)
+- **Why not HDF5?**: [docs/WHY_NOT_HDF5.md](https://github.com/phenomenon0/wshard/blob/main/docs/WHY_NOT_HDF5.md)
+- **Why not LeRobot?**: [docs/WHY_NOT_LEROBOT.md](https://github.com/phenomenon0/wshard/blob/main/docs/WHY_NOT_LEROBOT.md)
+- **Benchmarks**: [bench/README.md](https://github.com/phenomenon0/wshard/blob/main/bench/README.md)
+- **Security**: [SECURITY.md](https://github.com/phenomenon0/wshard/blob/main/SECURITY.md)
+- **Browser viewer**: [viewer/](https://github.com/phenomenon0/wshard/tree/main/viewer)
+
+MIT-licensed. No telemetry. No phone-home. No registration.
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" defer></script>
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const src = document.getElementById('release-src').textContent;
+    marked.use({ gfm: true, breaks: false });
+    document.getElementById('release').innerHTML = marked.parse(src);
+  });
+</script>
+
+</body>
+</html>
