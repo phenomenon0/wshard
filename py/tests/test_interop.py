@@ -605,7 +605,8 @@ def test_index_entry_orig_size_max_uint64(tmp_path):
 
 
 _GOLDEN_DIR = Path(__file__).resolve().parent.parent.parent / "golden"
-_REPO_ROOT = Path(__file__).resolve().parents[4]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_GO_MODULE_DIR = _REPO_ROOT / "go"
 
 
 def _go_env() -> dict[str, str]:
@@ -726,8 +727,10 @@ def test_go_package_interop_roundtrip(tmp_path):
     canonical W-SHARD metadata shape as the Python package."""
     if shutil.which("go") is None:
         pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
 
-    go_module_dir = _REPO_ROOT / "shard" / "go"
+    go_module_dir = _GO_MODULE_DIR
     go_out_path = tmp_path / "go_package_writer.wshard"
     go_writer = tmp_path / "go_writer_probe.go"
     go_out_literal = json.dumps(go_out_path.as_posix())
@@ -738,7 +741,7 @@ def test_go_package_interop_roundtrip(tmp_path):
 
             import (
                 "log"
-                shard "github.com/Neumenon/shard/go/shard"
+                shard "github.com/phenomenon0/wshard/go/shard"
             )
 
             func main() {{
@@ -832,7 +835,7 @@ def test_go_package_interop_roundtrip(tmp_path):
                 "encoding/json"
                 "log"
                 "os"
-                shard "github.com/Neumenon/shard/go/shard"
+                shard "github.com/phenomenon0/wshard/go/shard"
             )
 
             func main() {{
