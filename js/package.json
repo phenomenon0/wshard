@@ -1,0 +1,49 @@
+{
+  "name": "@wshard/core",
+  "version": "0.2.0",
+  "description": "W-SHARD - World-Model Episode Shard format for action-conditioned world modeling",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "machine-learning",
+    "world-model",
+    "episode",
+    "shard",
+    "training",
+    "binary-format",
+    "dreamer",
+    "reinforcement-learning"
+  ],
+  "author": "Neumenon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Neumenon/shard",
+    "directory": "wshard/js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27",
+    "fflate": "^0.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0"
+  },
+  "optionalDependencies": {
+    "xxhash-wasm": "^1.0.0"
+  }
+}

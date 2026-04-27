@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.tox/
+.coverage
+htmlcov/
+
+# Node / TypeScript
+node_modules/
+*.tsbuildinfo
+.next/
+.turbo/
+
+# Go
+/golden/generate
+*.test
+*.out
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Local artifacts
+*.log
+.env
+.env.local

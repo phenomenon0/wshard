@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wshard"
+version = "0.1.0"
+description = "W-SHARD: World Episode Adapter for Python"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Neumenon"}
+]
+keywords = ["world-model", "episode", "dreamer", "wshard", "reinforcement-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.20",
+    "crc32c>=2.3",
+    "xxhash>=3.0",
+    "zstandard>=0.21.0",
+    "lz4>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+hdf5 = [
+    "h5py>=3.0",
+]
+torch = [
+    "torch>=2.0",
+]
+bf16 = [
+    "ml-dtypes>=0.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/Neumenon/shard"
+Documentation = "https://github.com/Neumenon/shard/tree/main/wshard/py"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wshard*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
