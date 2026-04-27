@@ -90,7 +90,12 @@ except ImportError:
     upload_to_hub = None  # type: ignore
     download_from_hub = None  # type: ignore
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("wshard")
+except Exception:
+    __version__ = "0.1.0"
 __all__ = [
     # Types
     "Format",

@@ -1,17 +1,20 @@
 {
   "name": "@wshard/core",
-  "version": "0.2.0",
-  "description": "W-SHARD - World-Model Episode Shard format for action-conditioned world modeling",
+  "version": "0.1.0",
+  "description": "WShard - one-file episodes for robots, RL, and world models",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "src",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src",
+    "prepare": "tsc",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -28,8 +31,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Neumenon/shard",
-    "directory": "wshard/js"
+    "url": "https://github.com/phenomenon0/wshard",
+    "directory": "js"
   },
   "engines": {
     "node": ">=18.0.0"
