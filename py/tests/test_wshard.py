@@ -263,6 +263,87 @@ class TestWShardAdapter:
         finally:
             path.unlink()
 
+    def test_wshard_channel_filter(self):
+        """load_wshard(channels=[...]) should skip non-listed signal/action blocks."""
+        T = 16
+        ep = Episode(id="filter", length=T)
+        ep.observations["state"] = Channel(
+            name="state", dtype=DType.FLOAT32, shape=[4],
+            data=np.arange(T * 4, dtype=np.float32).reshape(T, 4),
+        )
+        ep.observations["pixels"] = Channel(
+            name="pixels", dtype=DType.FLOAT32, shape=[8],
+            data=np.zeros((T, 8), dtype=np.float32),
+        )
+        ep.actions["ctrl"] = Channel(
+            name="ctrl", dtype=DType.FLOAT32, shape=[2],
+            data=np.ones((T, 2), dtype=np.float32),
+        )
+        ep.actions["aux"] = Channel(
+            name="aux", dtype=DType.FLOAT32, shape=[3],
+            data=np.zeros((T, 3), dtype=np.float32),
+        )
+        ep.rewards = Channel(
+            name="reward", dtype=DType.FLOAT32, shape=[],
+            data=np.arange(T, dtype=np.float32),
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".wshard", delete=False) as f:
+            path = Path(f.name)
+        try:
+            save_wshard(ep, path)
+
+            full = load_wshard(path)
+            assert set(full.observations.keys()) == {"state", "pixels"}
+            assert set(full.actions.keys()) == {"ctrl", "aux"}
+
+            partial = load_wshard(path, channels=["state", "ctrl"])
+            assert set(partial.observations.keys()) == {"state"}
+            assert set(partial.actions.keys()) == {"ctrl"}
+            assert partial.rewards is not None
+            np.testing.assert_array_equal(
+                partial.observations["state"].data, full.observations["state"].data
+            )
+
+            empty = load_wshard(path, channels=[])
+            assert empty.observations == {}
+            assert empty.actions == {}
+            assert empty.rewards is not None  # always-keep
+        finally:
+            path.unlink()
+
+    def test_wshard_action_shape_roundtrip(self):
+        """Regression: multi-dim action channels must round-trip with shape preserved."""
+        T = 32
+        ep = Episode(id="action-shape", length=T)
+        ep.observations["state"] = Channel(
+            name="state",
+            dtype=DType.FLOAT32,
+            shape=[4],
+            data=np.random.randn(T, 4).astype(np.float32),
+        )
+        action_data = np.random.randn(T, 6).astype(np.float32)
+        ep.actions["ctrl"] = Channel(
+            name="ctrl",
+            dtype=DType.FLOAT32,
+            shape=[6],
+            data=action_data,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".wshard", delete=False) as f:
+            path = Path(f.name)
+        try:
+            save_wshard(ep, path)
+            loaded = load_wshard(path)
+            assert "ctrl" in loaded.actions
+            reloaded = loaded.actions["ctrl"]
+            assert reloaded.shape == [6], f"action shape lost: got {reloaded.shape}"
+            assert reloaded.data.shape == (T, 6)
+            assert reloaded.dtype == DType.FLOAT32
+            np.testing.assert_array_equal(reloaded.data, action_data)
+        finally:
+            path.unlink()
+
 
 class TestResidualEncoding:
     """Test Sign2ndDiff residual encoding."""
