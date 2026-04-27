@@ -8,7 +8,7 @@
 4. [Cross-Language Interop — One Format, Three Runtimes](#4-cross-language-interop--one-format-three-runtimes)
 5. [DeepData Bridge — Similarity Search Over Episodes](#5-deepdata-bridge--similarity-search-over-episodes)
 
-For market positioning, competitive landscape, and adoption context see [`MARKETING_BRIEF.md`](MARKETING_BRIEF.md).
+For internal positioning notes see [`../notes/MARKETING_BRIEF.md`](../notes/MARKETING_BRIEF.md). They are not part of the published spec — they are kept for context, not as claims.
 
 ---
 
@@ -16,7 +16,7 @@ For market positioning, competitive landscape, and adoption context see [`MARKET
 
 WShard (World-Model Episode Shard) is a binary file format and cross-language library for storing, reading, and managing trajectory data from robotics, reinforcement learning, and world model training pipelines.
 
-A single `.wshard` file is a self-contained episode: a time-indexed bundle of observations, actions, rewards, and termination signals recorded from an agent interacting with an environment. The file is a flat binary with O(1) block lookup, per-block compression, and data alignment for zero-copy reads.
+A single `.wshard` file is a self-contained episode: a time-indexed bundle of observations, actions, rewards, and termination signals recorded from an agent interacting with an environment. The file is a flat binary with fast name-hash lookup, per-block compression, and data alignment for low-copy reads.
 
 ### Not a database. Not a framework. A format.
 
@@ -51,13 +51,13 @@ Each named block is independently addressable. A training loop that only needs `
 
 | Component | Language | Lines | Status |
 |-----------|----------|-------|--------|
-| `wshard` Python package | Python | ~4,000 | Production |
-| `@wshard/core` npm package | TypeScript | ~3,500 | Production |
-| `shard` Go package | Go | ~2,000 | Production |
+| `wshard` Python package | Python | ~4,000 | Beta |
+| `@wshard/core` npm package | TypeScript | ~3,500 | Beta |
+| `shard` Go package | Go | ~2,000 | Beta |
 | Golden test fixtures | Go generator | 553 | Verified |
-| DeepData trajectory bridge | Python | ~500 | Production |
+| DeepData trajectory bridge | Python | ~500 | Experimental |
 
-Python: 103 tests, TypeScript: 15 tests, all passing. Go wshard is covered by the core shard package's test suite.
+Python: 103 tests, TypeScript: 15 tests, all passing locally. The cross-language conformance matrix runs in CI. Beta means the API and on-disk format are stable enough to try; we are looking for external users to surface real-world breakage before declaring 1.0.
 
 ---
 
@@ -114,7 +114,7 @@ Offset    Size    Field
 
 ### Why This Matters
 
-**O(1) lookup.** The name hash in each index entry allows binary search or hash-table lookup without touching the string table. For a file with 50 blocks, finding `signal/joint_pos` requires reading 64 bytes (header) + scanning 50 × 8-byte hashes.
+**Fast name lookup.** Each index entry carries an 8-byte xxHash64 of the block name. Finding `signal/joint_pos` requires reading the 64-byte header plus a scan over the index hashes — for a 50-block file, that is 64 + 50×8 = 464 bytes, with no string-table parse and no full deserialization. Readers may build an in-memory hash map at open time for O(1) repeat lookups, or scan in place for one-shot reads.
 
 **Per-block compression.** Each block carries its own compression flag. Video blocks can use zstd at high ratios. Small scalar blocks (reward, done) stay uncompressed. The reader detects compression from the entry flags — no header-level assumption needed.
 
@@ -213,16 +213,19 @@ Latent action embeddings and codebook indices use the `omen/` namespace:
 
 Every world model, every RL agent, every robot learning system consumes the same thing: episodes. Sequences of (observation, action, reward, done) tuples collected from environments. The datasets are large (DROID: 76K demonstrations, 2TB+), multi-modal (cameras + joint states + force/torque + audio), and heterogeneous (different robots, different environments, different sampling rates).
 
-There is no standard format for this data. Teams use:
+There is no small neutral format focused specifically on **one-file tensor episodes plus world-model prediction lanes**. Several mature ecosystems exist for adjacent problems — each is the right tool for a different shape of data:
 
-| Format | Limitations |
-|--------|-------------|
-| **HDF5** | Single-writer lock. No streaming append. Poor compression control. Python-centric. |
-| **RLDS/TFDS** | TensorFlow dependency. Rigid schema. Google ecosystem lock-in. |
-| **Parquet + MP4** (LeRobot v3) | Great for publishing. Poor for training-time random access. Two files per episode. |
-| **NPZ** (DreamerV3) | No metadata. No compression choice. No cross-language support. |
-| **MCAP** (Foxglove) | ROS-oriented. Message-based, not tensor-based. |
-| **Custom** | Every lab rolls their own. No interop. |
+| When you reach for… | What it is great at | Where WShard fits differently |
+|---|---|---|
+| **HDF5** | Mature scientific array storage; SWMR for one-writer/many-reader | Heavier than we wanted for self-contained per-episode files; no semantic lanes for predictions/uncertainty |
+| **RLDS / TFDS** | Standardized RL datasets in the TensorFlow ecosystem | We want a small file format, no TF dependency, with omen/uncert/residual lanes built in |
+| **LeRobot (Parquet + MP4)** | Hugging Face Hub-hosted robotics datasets, great for publishing | We target local training-time and runtime episode files with named tensor blocks |
+| **NPZ (DreamerV3)** | Quick numpy dumps | We add metadata, per-block compression, cross-language readers, and integrity checks |
+| **MCAP (Foxglove)** | Timestamped pub/sub robot logs | We are tensor/episode-first rather than message-log-first |
+| **Zarr** | Chunked N-dimensional arrays on cloud / object storage | We are single-episode-file oriented; a Zarr export bridge is on the roadmap |
+| **Custom binary** | Whatever a lab needs locally | We try to keep the spec small enough to be the boring default |
+
+The bet is that episode-shaped data — observations, actions, rewards, plus model predictions — deserves a small specialized container. If the user feedback says "bridges to existing formats are more valuable than the format itself," we will follow that.
 
 ### What's Actually Different About WShard
 
@@ -442,14 +445,14 @@ Hits return episode references; the caller reads the `.wshard` file directly for
 
 | Item | Path |
 |------|------|
-| Python package | `cogs/shard/wshard/py/wshard/` |
-| TypeScript package | `cogs/shard/wshard/js/src/` |
-| Go shard package | `cogs/shard/go/shard/` |
-| Golden fixtures | `cogs/shard/wshard/golden/` |
-| Python tests | `cogs/shard/wshard/py/tests/` |
-| TypeScript tests | `cogs/shard/wshard/js/tests/` |
-| Go tests | `cogs/shard/go/shard/*_test.go` |
-| DeepData bridge | `cogs/shard/wshard/py/wshard/deepdata_bridge.py` |
+| Python package | `py/wshard/` |
+| TypeScript package | `js/src/` |
+| Go shard package | `go/shard/` |
+| Golden fixtures | `golden/` |
+| Python tests | `py/tests/` |
+| TypeScript tests | `js/tests/` |
+| Go tests | `go/shard/*_test.go` |
+| DeepData bridge | `py/wshard/deepdata_bridge.py` |
 
 ## Appendix: Dependency Map
 

@@ -111,9 +111,12 @@ Data section (aligned entries)
 ## Cross-language compatibility
 
 W-SHARD files are binary-compatible across:
-- Go: `go/shard/`
-- Python: `wshard/py/wshard/`
-- TypeScript: `wshard/js/src/` (this package)
+- Go: `../go/shard/`
+- Python: `../py/wshard/`
+- TypeScript: `./src/` (this package)
+
+See the [project README](../README.md) for the format spec and the
+"What WShard is not" section.
 
 ## Testing
 

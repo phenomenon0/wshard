@@ -1,41 +1,93 @@
 # WShard
 
-Binary file format for world model episode data. One file per episode. Cross-language. Zero-copy reads.
+One-file episodes for robots, RL, and world models.
+
+A `.wshard` file stores one episode: observations, actions, rewards, done
+flags, metadata, and optional model prediction / uncertainty / residual
+lanes. Each block is independently addressable and independently
+compressed.
 
 ```
 episode.wshard
-├── meta/episode     → {"episode_id": "ep_001", "env_id": "Manip-v2", "length_T": 500}
-├── signal/rgb       → [500, 84, 84, 3] uint8     (zstd compressed)
-├── signal/joint_pos → [500, 7] float32            (uncompressed, 32-byte aligned)
-├── action/ctrl      → [500, 7] float32
-├── reward           → [500] float32
-└── done             → [500] bool
+├── meta/episode      → {"episode_id": "ep_001", "env_id": "Manip-v2", "length_T": 500}
+├── signal/rgb        → [500, 84, 84, 3] uint8     (zstd compressed)
+├── signal/joint_pos  → [500, 7] float32           (uncompressed, 32-byte aligned)
+├── action/ctrl       → [500, 7] float32
+├── reward            → [500] float32
+├── done              → [500] bool
+├── omen/joint_pos/dreamer    → [500, 7] float32   (model predictions)
+├── uncert/joint_pos/std      → [500, 7] float32   (uncertainty)
+└── residual/joint_pos/sign2nddiff → packed bits   (residual encoding)
 ```
 
-## Why
+## Try it in 60 seconds
 
-Trajectory data from robots, simulators, and RL environments has no standard format. Teams use HDF5 (single-writer, no streaming), NPZ (no metadata, no cross-language), RLDS (TensorFlow lock-in), or custom formats that break on the next project.
+```bash
+git clone https://github.com/phenomenon0/wshard
+cd wshard/py
+pip install -e ".[dev]"
 
-WShard is a flat binary with:
+python ../examples/write_cartpole.py
+python ../examples/read_cartpole.py examples/cartpole.wshard
+python ../examples/inspect_wshard.py examples/cartpole.wshard
+```
 
-- **Per-block compression** — zstd the video, leave the reward vector raw
-- **O(1) block lookup** — xxHash64 index, no deserialization to find one channel
-- **32-byte aligned data** — `mmap()` + pointer cast for zero-copy reads
-- **CRC32C checksums** — hardware-accelerated integrity verification
-- **Streaming append** — crash-safe `.partial` file pattern for live recording
-- **Chunked episodes** — split long episodes across files with continuity validation
+## Why WShard?
+
+Robotics and RL trajectory data has several good ecosystems already, but no
+small neutral file format focused specifically on **self-contained tensor
+episodes plus world-model prediction lanes**. WShard tries to fill that
+narrow gap:
+
+- **One file = one episode.** Move it, archive it, mmap it, ship it across a
+  network — the file is the unit of work.
+- **Per-block compression.** Zstd the video, leave the reward vector raw.
+- **Fast name lookup.** Index entries carry an xxHash64 of the block name, so
+  finding `signal/joint_pos` is a quick scan over fixed-size index slots,
+  no string-table parse, no full deserialization.
+- **32-byte aligned data.** Read with `mmap()` + pointer cast for low-copy
+  reads.
+- **CRC32C checksums.** Hardware-accelerated integrity per block.
+- **Streaming append.** `.partial` file pattern for crash-safe live recording.
+- **Cross-language.** Python, TypeScript, and Go readers/writers from one
+  spec.
+
+## What WShard is not
+
+WShard is not a database. It is not a training framework. It is not a
+replacement for [LeRobot][lerobot], [MCAP][mcap], [Zarr][zarr], [HDF5][hdf5],
+or Parquet.
+
+| When you want… | Reach for… |
+|---|---|
+| Hugging Face Hub-hosted robotics datasets | [LeRobot][lerobot] (Parquet + MP4) |
+| Timestamped pub/sub robot logs | [MCAP][mcap] |
+| Chunked N-dimensional arrays on cloud storage | [Zarr][zarr] |
+| Mature scientific array storage | [HDF5][hdf5] |
+| Self-contained episode files with named tensor blocks **and** world-model lanes | WShard |
+
+WShard complements these formats. We provide bridges where it makes sense.
+
+[lerobot]: https://github.com/huggingface/lerobot
+[mcap]: https://mcap.dev/
+[zarr]: https://zarr.dev/
+[hdf5]: https://www.hdfgroup.org/solutions/hdf5/
 
 ## Install
 
+These are git-install commands. Registry packages on PyPI / npm will follow
+once the format and API stabilize.
+
 ```bash
 # Python
-pip install wshard
+pip install "git+https://github.com/phenomenon0/wshard.git#subdirectory=py"
 
-# TypeScript
-npm install @wshard/core
+# TypeScript (clone + build is the most reliable path today)
+git clone https://github.com/phenomenon0/wshard
+cd wshard/js && npm ci && npm run build
 
 # Go
-import "github.com/Neumenon/shard/go/shard"
+go get github.com/phenomenon0/wshard/go@latest
 ```
 
 ## Quick Start
@@ -113,7 +165,7 @@ await reader.close();
 ### Go
 
 ```go
-import "github.com/Neumenon/shard/go/shard"
+import "github.com/phenomenon0/wshard/go/shard"
 
 // Write
 ep := &shard.WShardEpisode{
@@ -136,7 +188,8 @@ ep, err := shard.OpenWShard("episode.wshard")
 
 ## Format
 
-Shard container (role `0x05`). 64-byte header, 48-byte index entries, aligned data blocks.
+64-byte header, 48-byte index entries, aligned data blocks. Built on the
+Shard container (role `0x05`).
 
 ```
 [Header 64B] [Index N×48B] [String Table] [Padding] [Data Blocks...]
@@ -149,6 +202,7 @@ Block names are hierarchical paths:
 | `meta/` | JSON metadata (`meta/wshard`, `meta/episode`, `meta/channels`) |
 | `signal/` | Observation tensors |
 | `action/` | Action tensors |
+| `time/` | Timestamps (`time/ticks`, `time/timestamps_ns`) |
 | `omen/` | Model prediction tensors |
 | `uncert/` | Uncertainty estimates |
 | `residual/` | Compressed residual encodings |
@@ -158,6 +212,54 @@ Block names are hierarchical paths:
 13 data types: `f32`, `f64`, `f16`, `bf16`, `i64`, `i32`, `i16`, `i8`, `u64`, `u32`, `u16`, `u8`, `bool`.
 
 Compression: none, zstd, or lz4 — per block. Checksums: CRC32C (Castagnoli).
+
+See [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md) for the byte-level spec.
+
+## Cross-language parity
+
+All three implementations produce identical binary output for the same
+input. Verified by golden-file tests:
+
+- Go generates reference `.wshard` files (`golden/generate.go`)
+- Python and TypeScript read them and assert byte-level correctness
+- CRC32C, xxHash64, dtype sizes, and block layout are checked against
+  committed reference values (`golden/golden_hashes.json`)
+
+```
+CRC32C("hello")          = 0x9a71bb4c
+xxHash64("signal/obs")   = 0x86f8c8413116a0ae
+```
+
+## Testing
+
+```bash
+# Python
+cd py && pytest tests/ -v
+
+# TypeScript
+cd js && npm test
+
+# Go
+cd go && go test ./shard/...
+
+# Regenerate golden fixtures (rare; CI checks for drift)
+cd golden && go run generate.go
+```
+
+## Status
+
+**Beta.** The format is stable enough to try, but we are still looking for
+feedback on schemas, video blocks, and converters. The Show HN launch is
+intentional — the goal is to find sharp edges before declaring 1.0.
+
+## Known limitations
+
+- **No native video block type.** Camera data is stored as raw tensors. H.264
+  / H.265 / AV1 block types are future work.
+- **No Arrow / Polars / DuckDB integration** yet.
+- **No formal schema registry** — block-name conventions are advisory.
+- **Cloud / object-store behavior** has not been stress-tested.
+- **Few external users** so far. The launch is the bug-finding pass.
 
 ## Features
 
@@ -175,7 +277,7 @@ manifest = writer.finalize_manifest()
 validate_chunk_continuity(manifest)  # catches gaps, duplicates, discontinuities
 ```
 
-### Multi-Modal Observations (VLA)
+### Multi-modal observations
 
 ```python
 from wshard import add_multimodal_observation, get_multimodal_observations
@@ -188,7 +290,7 @@ add_multimodal_observation(ep, "wrist", Modality.PROPRIOCEPTION, joint_channel)
 rgb_channels = get_multimodal_observations(ep, modality=Modality.RGB)
 ```
 
-### Residual Compression
+### Residual compression
 
 ```python
 from wshard.residual import compute_sign2nd_diff, pack_residual_bits, unpack_residual_bits
@@ -197,56 +299,17 @@ residual = compute_sign2nd_diff(signal)  # {-1, 0, +1} array
 packed = pack_residual_bits(residual)     # 2 bits per element
 ```
 
-### DeepData Bridge (Trajectory Search)
+### Format conversion (experimental)
 
-```python
-from wshard.deepdata_bridge import TrajectoryIngestor, TrajectoryRetriever
-
-ingestor = TrajectoryIngestor("http://deepdata:8080", embedder=encoder)
-ingestor.ingest_episode("episodes/ep_001.wshard")
-
-retriever = TrajectoryRetriever("http://deepdata:8080", embedder=encoder)
-similar = retriever.search_similar_episodes(
-    query_obs=observation, top_k=10, env_id="Manip-v2"
-)
-```
-
-### Format Conversion
+Converters for DreamerV3 NPZ, Minari, and D4RL exist in `wshard.convert` but
+are **not yet covered by integration tests against real fixtures from those
+frameworks**. Treat as experimental and report breakage:
 
 ```python
 from wshard import load, save
 
-ep = load("dreamer_episode.npz")     # auto-detect: DreamerV3
-save(ep, "episode.wshard")           # convert to WShard
-
-ep = load("episode.wshard")
-save(ep, "episode.npz")             # convert back
-```
-
-## Cross-Language Parity
-
-All three implementations produce identical binary output for the same input. Verified by golden file tests:
-
-- Go generates reference `.wshard` files (`golden/generate.go`)
-- Python and TypeScript read them and assert byte-level correctness
-- CRC32C, xxHash64, dtype sizes, and block layout are tested against committed reference values (`golden/golden_hashes.json`)
-
-```
-CRC32C("hello")          = 0x9a71bb4c
-xxHash64("signal/obs")   = 0x86f8c8413116a0ae
-```
-
-## Testing
-
-```bash
-# Python (103 tests)
-cd wshard/py && python -m pytest tests/ -v
-
-# TypeScript (15 tests)
-cd wshard/js && npm test
-
-# Go — wshard lives inside the full shard package
-cd go && go test ./shard/ -v
+ep = load("dreamer_episode.npz")    # auto-detect: DreamerV3
+save(ep, "episode.wshard")          # convert to WShard
 ```
 
 ## Dependencies
@@ -254,16 +317,26 @@ cd go && go test ./shard/ -v
 | Language | Core Dependencies |
 |----------|------------------|
 | Python | numpy, crc32c, xxhash, zstandard, lz4 |
-| TypeScript | @bokuweb/zstd-wasm, fflate, xxhash-wasm |
+| TypeScript | @bokuweb/zstd-wasm, fflate, xxhash-wasm (optional) |
 | Go | cespare/xxhash/v2, klauspost/compress, stdlib crc32 |
 
-Optional Python: `ml-dtypes` (bf16), `h5py` (HDF5 import), `torch` (PyTorch tensors)
+Optional Python: `ml-dtypes` (bf16), `h5py` (HDF5 import), `torch` (PyTorch tensors).
+
+## Contributing
+
+Open issues for broken readers, bad benchmarks, malformed files, or
+converter requests. The most useful feedback right now:
+
+1. What format do you use today?
+2. Where would WShard break in your pipeline?
+3. What benchmark would make this credible?
+4. Which converter should exist first: LeRobot, MCAP, RLDS, Minari, D4RL, or Zarr?
 
 ## Docs
 
-- [Deep Dive](docs/DEEP_DIVE.md) — Format specification, market analysis, architecture decisions
-- [Marketing Brief](docs/MARKETING_BRIEF.md) — Positioning, messaging, competitive landscape
+- [Deep Dive](docs/DEEP_DIVE.md) — Format specification, architecture decisions.
+- [Security](SECURITY.md) — Threat model and reader hardening.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
