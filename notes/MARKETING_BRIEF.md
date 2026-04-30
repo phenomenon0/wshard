@@ -91,7 +91,7 @@ episode_42.wshard (1.8 MB)
 
 ### Tertiary: World model teams
 
-**Profile:** Training video prediction models (Cosmos-scale). Generating synthetic trajectory data. Managing millions of episodes.
+**Profile:** Training video-prediction models. Generating synthetic trajectory data. Managing many episodes.
 
 **Pain:** No standard format for synthetic trajectories. HDF5 doesn't scale. Custom formats prevent collaboration.
 
