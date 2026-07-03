@@ -338,6 +338,36 @@ def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
         ep.terminations.data = ep.terminations.data.astype(np.bool_)
         ep.terminations.dtype = DType.BOOL
 
+    # Omen blocks: omen/{channel_id}/{model_id}. Files written by this module
+    # carry dtype/shape in meta/wshard's omen_channels; Go-written files do not,
+    # so fall back to raw uint8 bytes rather than guessing a dtype.
+    omen_defs = {d["block"]: d for d in meta_wshard.get("omen_channels", [])}
+    for name, block_data in blocks.items():
+        if not name.startswith("omen/"):
+            continue
+        parts = name[5:].split("/", 1)
+        if len(parts) != 2:
+            continue
+        ch_id, model_id = parts
+        omen_def = omen_defs.get(name)
+        if omen_def is not None:
+            ch = _parse_tensor_block(
+                block_data,
+                {
+                    "id": name,
+                    "dtype": omen_def.get("dtype", "f32"),
+                    "shape": omen_def.get("shape", []),
+                },
+            )
+        else:
+            ch = Channel(
+                name=name,
+                dtype=DType.UINT8,
+                shape=[],
+                data=np.frombuffer(block_data, dtype=np.uint8),
+            )
+        ep.omens.setdefault(ch_id, {})[model_id] = ch
+
     residual_encoding = meta_wshard.get("residual_encoding", RESIDUAL_ENCODING_RAW)
 
     for name, block_data in blocks.items():
@@ -439,6 +469,19 @@ def _encode_wshard(
         "alignment": 32,
         "residual_encoding": RESIDUAL_ENCODING_COWRIE_BITMASK if HAS_COWRIE else RESIDUAL_ENCODING_RAW,
     }
+    # Omen blocks are raw tensor bytes on disk (matching the Go writer, which
+    # records no dtype/shape for them). Record dtype/shape here so the Python
+    # decoder can reconstruct typed channels; Go ignores the extra key.
+    omen_channel_defs = []
+    for ch_id, models in ep.omens.items():
+        for model_id, ch in models.items():
+            omen_channel_defs.append({
+                "block": f"omen/{ch_id}/{model_id}",
+                "dtype": ch.dtype.value,
+                "shape": ch.shape,
+            })
+    if omen_channel_defs:
+        meta_wshard["omen_channels"] = omen_channel_defs
     blocks["meta/wshard"] = json.dumps(meta_wshard).encode("utf-8")
 
     # Meta/episode
@@ -520,6 +563,20 @@ def _encode_wshard(
     # Done
     if ep.terminations:
         blocks["done"] = _encode_tensor(ep.terminations)
+
+    # Omen blocks (cached model predictions): omen/{channel_id}/{model_id}
+    for ch_id, models in ep.omens.items():
+        for model_id, ch in models.items():
+            blocks[f"omen/{ch_id}/{model_id}"] = _encode_tensor(ch)
+
+    # Residual blocks: residual/{channel_id}/sign2nddiff
+    for ch_id, res in ep.residuals.items():
+        if res.type != "sign2nddiff":
+            raise ValueError(
+                f"residual '{ch_id}' has type '{res.type}'; only 'sign2nddiff' "
+                "is supported by the wshard on-disk format"
+            )
+        blocks[f"residual/{ch_id}/sign2nddiff"] = res.data
 
     # Time ticks
     ticks = np.arange(ep.length, dtype=np.int32)

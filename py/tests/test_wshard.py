@@ -839,6 +839,71 @@ class TestLatentActions:
         ep = Episode(id="empty", length=5)
         assert get_latent_actions(ep, "nonexistent") is None
 
+    def test_omens_and_residuals_disk_roundtrip(self):
+        """Omens and residuals must survive save_wshard -> load_wshard.
+
+        Regression test: the encoder previously never serialized ep.omens /
+        ep.residuals, so the prediction lanes — the format's headline feature —
+        were silently dropped on save. The in-memory get/set tests above cannot
+        catch that; only a disk round-trip can.
+        """
+        from wshard.types import Residual
+
+        ep = Episode(id="lanes-roundtrip", length=10)
+        ep.observations["state"] = Channel(
+            name="state", dtype=DType.FLOAT32, shape=[4],
+            data=np.random.randn(10, 4).astype(np.float32),
+        )
+
+        pred = Channel(
+            name="pred", dtype=DType.FLOAT32, shape=[4],
+            data=np.random.randn(10, 4).astype(np.float32),
+        )
+        codebook = Channel(
+            name="codebook", dtype=DType.INT32, shape=[],
+            data=np.random.randint(0, 256, size=10, dtype=np.int32),
+        )
+        ep.omens["state"] = {"dreamer_v3": pred}
+        ep.omens["latent_action_codebook"] = {"genie3_v1": codebook}
+        ep.residuals["state"] = Residual(
+            channel_id="state", type="sign2nddiff", data=b"\x0f\xf0\xaa",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "lanes.wshard")
+            save_wshard(ep, path)
+            ep2 = load_wshard(path)
+
+        got_pred = ep2.omens["state"]["dreamer_v3"]
+        assert got_pred.dtype == DType.FLOAT32
+        np.testing.assert_array_equal(got_pred.data, pred.data)
+
+        got_cb = ep2.omens["latent_action_codebook"]["genie3_v1"]
+        assert got_cb.dtype == DType.INT32
+        np.testing.assert_array_equal(got_cb.data, codebook.data)
+
+        res = ep2.residuals["state"]
+        assert res.type == "sign2nddiff"
+        assert bytes(res.data) == b"\x0f\xf0\xaa"
+
+    def test_unsupported_residual_type_fails_loud(self):
+        """A residual type the format cannot store must raise, not vanish."""
+        from wshard.types import Residual
+
+        ep = Episode(id="bad-residual", length=5)
+        ep.observations["state"] = Channel(
+            name="state", dtype=DType.FLOAT32, shape=[2],
+            data=np.zeros((5, 2), dtype=np.float32),
+        )
+        ep.residuals["state"] = Residual(
+            channel_id="state", type="delta_q", data=b"\x00",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "bad.wshard")
+            with pytest.raises(ValueError, match="delta_q"):
+                save_wshard(ep, path)
+
 
 # ============================================================
 # Gap 1: Chunked Episodes tests
