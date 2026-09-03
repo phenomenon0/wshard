@@ -1,10 +1,13 @@
 package shard
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -503,5 +506,165 @@ func TestOpenWShardGoldenLatentAction(t *testing.T) {
 	}
 	if len(codebook.Data) != 8*4 { // 8 timesteps * 4 bytes (i32)
 		t.Errorf("codebook data length = %d, want %d", len(codebook.Data), 8*4)
+	}
+}
+
+// ============================================================
+// Identity (meta/identity, glyph SPEC-CANON.md §4)
+// ============================================================
+
+func identityEpisode() *WShardEpisode {
+	const T = 20
+	state := make([]byte, T*4*4)
+	ctrl := make([]byte, T*2*4)
+	for i := range state {
+		state[i] = byte(i * 7)
+	}
+	for i := range ctrl {
+		ctrl[i] = byte(i * 13)
+	}
+	rewards := make([]float32, T)
+	dones := make([]bool, T)
+	for i := range rewards {
+		rewards[i] = float32(i) * 0.25
+	}
+	dones[T-1] = true
+	return &WShardEpisode{
+		ID:       "identity-ep",
+		EnvID:    "identity-env",
+		LengthT:  T,
+		Timebase: WShardTimebase{Type: "ticks", TickHz: 30},
+		Observations: map[string]*WShardChannel{
+			"state": {Name: "state", DType: "float32", Shape: []int{4}, Data: state},
+		},
+		Actions: map[string]*WShardChannel{
+			"ctrl": {Name: "ctrl", DType: "float32", Shape: []int{2}, Data: ctrl},
+		},
+		Rewards:       rewards,
+		Terminations:  dones,
+		TimestepRange: [2]int{0, T - 1},
+	}
+}
+
+func TestIdentityIsContentNotLayout(t *testing.T) {
+	// Two writes of one episode: one identity. One content change: another.
+	dir := t.TempDir()
+	ids := map[string]bool{}
+	for _, name := range []string{"a.wshard", "b.wshard"} {
+		p := filepath.Join(dir, name)
+		if err := CreateWShard(p, identityEpisode()); err != nil {
+			t.Fatal(err)
+		}
+		verified, err := VerifyIdentity(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		trusted, err := EpisodeIdentity(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if verified != trusted || len(verified) != 64 {
+			t.Fatalf("VerifyIdentity %q != EpisodeIdentity %q", verified, trusted)
+		}
+		ids[verified] = true
+	}
+	if len(ids) != 1 {
+		t.Fatalf("same content, %d identities: %v", len(ids), ids)
+	}
+	ep := identityEpisode()
+	ep.Observations["state"].Data[0] ^= 1
+	p := filepath.Join(dir, "c.wshard")
+	if err := CreateWShard(p, ep); err != nil {
+		t.Fatal(err)
+	}
+	id, err := VerifyIdentity(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids[id] {
+		t.Fatal("one flipped bit, same identity")
+	}
+}
+
+func TestIdentityBlockIsCanonicalJSON(t *testing.T) {
+	// Pinned bytes: what Python's glyph.canon_json emits for the same leaf map.
+	got, err := identityBlockBytes(map[string]string{"signal/b": "22", "meta/a": "11"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"entries":{"meta/a":"11","signal/b":"22"},"leaf":"sha256","v":1}`
+	if string(got) != want {
+		t.Fatalf("identity block\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestIdentityCatchesForgedCRC(t *testing.T) {
+	// CRC32C is recomputable by whoever edits the file; the identity is not.
+	// Flip a signal byte AND fix its CRC: OpenWShard is happy, VerifyIdentity is not.
+	p := filepath.Join(t.TempDir(), "ep.wshard")
+	if err := CreateWShard(p, identityEpisode()); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenShard(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := r.Lookup("signal/state")
+	if i < 0 {
+		t.Fatal("signal/state not found")
+	}
+	e := *r.GetEntryInfo(i)
+	r.Close()
+
+	buf, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf[e.DataOffset] ^= 0xFF
+	block := buf[e.DataOffset : e.DataOffset+e.DiskSize]
+	crc := crc32.Checksum(block, crc32.MakeTable(crc32.Castagnoli))
+	binary.LittleEndian.PutUint32(buf[ShardHeaderSize+i*ShardIndexEntrySize+40:], crc)
+	if err := os.WriteFile(p, buf, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenWShard(p); err != nil {
+		t.Fatalf("CRC matches, the container should not notice: %v", err)
+	}
+	_, err = VerifyIdentity(p)
+	if err == nil || !strings.Contains(err.Error(), "signal/state") {
+		t.Fatalf("VerifyIdentity should name signal/state, got %v", err)
+	}
+}
+
+func TestGoldenIdentityVerifies(t *testing.T) {
+	// The standalone generator in golden/ writes meta/identity independently;
+	// shard.VerifyIdentity must re-derive it, including through compressed entries.
+	hashesPath := filepath.Join("..", "..", "golden", "golden_hashes.json")
+	raw, err := os.ReadFile(hashesPath)
+	if err != nil {
+		t.Skip("no golden_hashes.json")
+	}
+	var hashes map[string]any
+	if err := json.Unmarshal(raw, &hashes); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for k, v := range hashes {
+		if !strings.HasPrefix(k, "identity_") {
+			continue
+		}
+		p := filepath.Join("..", "..", "golden", strings.TrimPrefix(k, "identity_")+".wshard")
+		got, err := VerifyIdentity(p)
+		if err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if got != v.(string) {
+			t.Fatalf("%s: identity %s, golden_hashes says %s", p, got, v)
+		}
+		n++
+	}
+	if n == 0 {
+		t.Skip("golden_hashes.json has no identity_* keys (regenerate)")
 	}
 }

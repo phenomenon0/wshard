@@ -63,6 +63,8 @@ from .dreamer import load_dreamer, save_dreamer
 from .wshard import (
     load_wshard,
     save_wshard,
+    episode_identity,
+    verify_identity,
     # Gap 5: VLA Multi-Modal
     add_multimodal_observation,
     get_multimodal_observations,
@@ -152,6 +154,8 @@ __all__ = [
     "save_dreamer",
     "load_wshard",
     "save_wshard",
+    "episode_identity",
+    "verify_identity",
     # HuggingFace Hub (optional)
     "HuggingFaceAdapter",
     "upload_to_hub",

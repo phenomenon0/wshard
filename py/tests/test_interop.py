@@ -880,3 +880,12 @@ def test_go_package_interop_roundtrip(tmp_path):
     assert summary["has_state_pos"] is True
     assert summary["has_ctrl"] is True
     assert summary["state_pos_dtype"] == "f32"
+
+
+def test_golden_identity_parity():
+    """Cross-language parity: Python re-derives the identity Go committed into meta/identity."""
+    hashes = _load_golden_hashes()
+    if hashes is None or "identity_simple_episode" not in hashes:
+        pytest.skip("golden_hashes.json has no identity_simple_episode (regenerate with Go)")
+    from wshard import verify_identity
+    assert verify_identity(_GOLDEN_DIR / "simple_episode.wshard") == hashes["identity_simple_episode"]

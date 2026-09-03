@@ -198,6 +198,13 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 		_ = os.Remove(path)
 	}
 
+	// Every entry's uncompressed sha256, committed by meta/identity (written last).
+	leaves := map[string]string{}
+	put := func(name string, data []byte, contentType uint16) error {
+		leaves[name] = leafHex(data)
+		return w.WriteEntryTyped(name, data, contentType)
+	}
+
 	// meta/wshard
 	metaJSON, err := json.Marshal(map[string]any{
 		"format":         "W-SHARD",
@@ -209,7 +216,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 		cleanup()
 		return fmt.Errorf("wshard: marshal meta/wshard: %w", err)
 	}
-	if err := w.WriteEntryTyped("meta/wshard", metaJSON, ContentTypeJSON); err != nil {
+	if err := put("meta/wshard", metaJSON, ContentTypeJSON); err != nil {
 		cleanup()
 		return fmt.Errorf("wshard: write meta/wshard: %w", err)
 	}
@@ -230,7 +237,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 		cleanup()
 		return fmt.Errorf("wshard: marshal meta/episode: %w", err)
 	}
-	if err := w.WriteEntryTyped("meta/episode", epJSON, ContentTypeJSON); err != nil {
+	if err := put("meta/episode", epJSON, ContentTypeJSON); err != nil {
 		cleanup()
 		return fmt.Errorf("wshard: write meta/episode: %w", err)
 	}
@@ -264,7 +271,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 		cleanup()
 		return fmt.Errorf("wshard: marshal meta/channels: %w", err)
 	}
-	if err := w.WriteEntryTyped("meta/channels", chanJSON, ContentTypeJSON); err != nil {
+	if err := put("meta/channels", chanJSON, ContentTypeJSON); err != nil {
 		cleanup()
 		return fmt.Errorf("wshard: write meta/channels: %w", err)
 	}
@@ -272,7 +279,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 	// signal/*
 	for _, name := range sortedChannelNames(ep.Observations) {
 		ch := ep.Observations[name]
-		if err := w.WriteEntry(JoinPath("signal", name), ch.Data); err != nil {
+		if err := put(JoinPath("signal", name), ch.Data, ContentTypeUnknown); err != nil {
 			cleanup()
 			return fmt.Errorf("wshard: write signal/%s: %w", name, err)
 		}
@@ -281,7 +288,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 	// action/*
 	for _, name := range sortedChannelNames(ep.Actions) {
 		ch := ep.Actions[name]
-		if err := w.WriteEntry(JoinPath("action", name), ch.Data); err != nil {
+		if err := put(JoinPath("action", name), ch.Data, ContentTypeUnknown); err != nil {
 			cleanup()
 			return fmt.Errorf("wshard: write action/%s: %w", name, err)
 		}
@@ -292,7 +299,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 	for i, r := range ep.Rewards {
 		binary.LittleEndian.PutUint32(rewardBuf[i*4:], math.Float32bits(r))
 	}
-	if err := w.WriteEntry("reward", rewardBuf); err != nil {
+	if err := put("reward", rewardBuf, ContentTypeUnknown); err != nil {
 		cleanup()
 		return fmt.Errorf("wshard: write reward: %w", err)
 	}
@@ -304,7 +311,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 			doneBuf[i] = 1
 		}
 	}
-	if err := w.WriteEntry("done", doneBuf); err != nil {
+	if err := put("done", doneBuf, ContentTypeUnknown); err != nil {
 		cleanup()
 		return fmt.Errorf("wshard: write done: %w", err)
 	}
@@ -313,7 +320,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 	for chID, models := range ep.Omens {
 		for modelID, ch := range models {
 			blockName := OmenBlockName(chID, modelID)
-			if err := w.WriteEntry(blockName, ch.Data); err != nil {
+			if err := put(blockName, ch.Data, ContentTypeUnknown); err != nil {
 				cleanup()
 				return fmt.Errorf("wshard: write %s: %w", blockName, err)
 			}
@@ -322,7 +329,7 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 
 	// uncert blocks
 	for blockName, ch := range ep.Uncerts {
-		if err := w.WriteEntry(blockName, ch.Data); err != nil {
+		if err := put(blockName, ch.Data, ContentTypeUnknown); err != nil {
 			cleanup()
 			return fmt.Errorf("wshard: write %s: %w", blockName, err)
 		}
@@ -331,10 +338,20 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 	// residual blocks
 	for chID, res := range ep.Residuals {
 		blockName := ResidualSign2ndDiffBlockName(chID)
-		if err := w.WriteEntry(blockName, res.Data); err != nil {
+		if err := put(blockName, res.Data, ContentTypeUnknown); err != nil {
 			cleanup()
 			return fmt.Errorf("wshard: write %s: %w", blockName, err)
 		}
+	}
+
+	identity, err := identityBlockBytes(leaves)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("wshard: marshal %s: %w", IdentityBlock, err)
+	}
+	if err := w.WriteEntryTyped(IdentityBlock, identity, ContentTypeJSON); err != nil {
+		cleanup()
+		return fmt.Errorf("wshard: write %s: %w", IdentityBlock, err)
 	}
 
 	return w.Close()

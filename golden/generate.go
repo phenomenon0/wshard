@@ -9,13 +9,17 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/zstd"
@@ -51,6 +55,25 @@ func crc32c(data []byte) uint32 { return crc32.Checksum(data, crc32cTable) }
 
 func xxh64(s string) uint64 { return xxhash.Sum64String(s) }
 
+func sha256hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// identityBlock is the meta/identity entry (glyph SPEC-CANON.md §4): every
+// other entry's uncompressed sha256 as canonical JSON. Independent of the
+// shard package on purpose, like the rest of this writer.
+func identityBlock(leaves map[string]string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	err := enc.Encode(map[string]any{"v": 1, "leaf": "sha256", "entries": leaves})
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), err
+}
+
+// identities: golden file name -> sha256 of its meta/identity, for genHashes.
+var identities = map[string]string{}
+
 // ============================================================
 // Low-level shard writer (standalone, no package import)
 // ============================================================
@@ -62,6 +85,7 @@ type entry struct {
 	checksum    uint32
 	flags       uint16 // entry flags (compression bits)
 	contentType uint16
+	sha         string // sha256 of uncompressed data (identity leaf)
 }
 
 type shardWriter struct {
@@ -78,12 +102,14 @@ func (w *shardWriter) addEntry(name string, data []byte, ct uint16) {
 		checksum:    crc32c(data),
 		flags:       0,
 		contentType: ct,
+		sha:         sha256hex(data),
 	})
 }
 
 func (w *shardWriter) addEntryCompressed(name string, data []byte, ct uint16) {
 	origSize := len(data)
 	checksum := crc32c(data)
+	sha := sha256hex(data)
 
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	if err != nil {
@@ -101,6 +127,7 @@ func (w *shardWriter) addEntryCompressed(name string, data []byte, ct uint16) {
 			checksum:    checksum,
 			flags:       entryFlagCompressed | entryFlagZstd,
 			contentType: ct,
+			sha:         sha,
 		})
 	} else {
 		w.entries = append(w.entries, entry{
@@ -110,11 +137,24 @@ func (w *shardWriter) addEntryCompressed(name string, data []byte, ct uint16) {
 			checksum:    checksum,
 			flags:       0,
 			contentType: ct,
+			sha:         sha,
 		})
 	}
 }
 
 func (w *shardWriter) writeTo(path string) error {
+	// meta/identity last: commits to every other entry's uncompressed bytes.
+	leaves := map[string]string{}
+	for _, e := range w.entries {
+		leaves[e.name] = e.sha
+	}
+	ident, err := identityBlock(leaves)
+	if err != nil {
+		return err
+	}
+	w.addEntry("meta/identity", ident, contentTypeJSON)
+	identities[strings.TrimSuffix(filepath.Base(path), ".wshard")] = sha256hex(ident)
+
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -737,6 +777,9 @@ func genHashes(dir string) error {
 			"u64":  8,
 			"bool": 1,
 		},
+	}
+	for name, id := range identities {
+		hashes["identity_"+name] = id
 	}
 
 	data, err := json.MarshalIndent(hashes, "", "  ")

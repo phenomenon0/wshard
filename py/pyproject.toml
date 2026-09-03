@@ -30,6 +30,7 @@ dependencies = [
     "xxhash>=3.0",
     "zstandard>=0.21.0",
     "lz4>=4.0.0",
+    "glyph-py>=1.0.1",
 ]
 
 [project.optional-dependencies]

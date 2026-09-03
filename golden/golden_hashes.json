@@ -15,6 +15,12 @@
     "u64": 8,
     "u8": 1
   },
+  "identity_dtype_zoo": "1666d48dd3cc6eab7718036250424026631ddc3eca813d698381225571dc7664",
+  "identity_latent_action": "a6366247f1ec2fdbdc12c91bc291db4518971003d3746a4de644bfcfea2cbc85",
+  "identity_multimodal": "0d42911fafa28ca01fb9f726ae196a2292950abc2c575ee87a9c29515cc22cc5",
+  "identity_omen_uncert": "49e98e2bc4eb714f424d86f38cd252c18ba1534a6a80a0cc414b685c8eb03c9c",
+  "identity_per_block_compressed": "45af700e6d9d896e8d2c22a633db6b3cbde791086f1ead9947ff0ed5e329bac9",
+  "identity_simple_episode": "ebf8d6609b8900b0626c21d3726c9c475bc320ad48d25cf4b7cfdbf7a7b897c6",
   "xxhash64_meta_manifest": "0x9a191dcd325813d3",
   "xxhash64_signal_obs": "0x86f8c8413116a0ae"
 }

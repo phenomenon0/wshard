@@ -207,7 +207,7 @@ Block names are hierarchical paths:
 
 | Prefix | Content |
 |--------|---------|
-| `meta/` | JSON metadata (`meta/wshard`, `meta/episode`, `meta/channels`) |
+| `meta/` | JSON metadata (`meta/wshard`, `meta/episode`, `meta/channels`, `meta/identity`) |
 | `signal/` | Observation tensors |
 | `action/` | Action tensors |
 | `time/` | Timestamps (`time/ticks`, `time/timestamps_ns`) |
@@ -221,6 +221,15 @@ Block names are hierarchical paths:
 
 Compression: none, zstd, or lz4 — per block. Checksums: CRC32C (Castagnoli).
 
+Identity: `meta/identity` is written last and holds
+`{"entries":{"<block>":"<sha256 of the block's uncompressed bytes>",…},"leaf":"sha256","v":1}`
+as canonical JSON ([glyph SPEC-CANON §4](../glyph/SPEC-CANON.md)). The file's
+identity is `sha256` of that block — `episode_identity(path)` in Python,
+`EpisodeIdentity(path)` in Go: identical across none/zstd/lz4 layouts, different
+for any content change. `verify_identity` / `VerifyIdentity` re-hash every block
+against it; CRC32C only proves a block matches its own index slot, which whoever
+edits the file can rewrite. The streaming writers do not write an identity yet.
+
 See [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md) for the byte-level spec.
 
 ## Cross-language parity
@@ -232,6 +241,8 @@ input. Verified by golden-file tests:
 - Python and TypeScript read them and assert byte-level correctness
 - CRC32C, xxHash64, dtype sizes, and block layout are checked against
   committed reference values (`golden/golden_hashes.json`)
+- `meta/identity` in every golden file is re-derived by Python `verify_identity`
+  and Go `VerifyIdentity` and matched to `identity_<file>` in the same JSON
 
 ```
 CRC32C("hello")          = 0x9a71bb4c

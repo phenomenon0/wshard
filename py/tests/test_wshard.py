@@ -1165,3 +1165,81 @@ class TestStreamingAppend:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ============================================================
+# Identity (meta/identity, glyph SPEC-CANON.md §4)
+# ============================================================
+
+import struct as _struct
+
+from wshard import episode_identity, verify_identity
+from wshard.wshard import (
+    HEADER_SIZE,
+    INDEX_ENTRY_SIZE,
+    compute_crc32,
+    _parse_index_entry,
+)
+
+
+def _identity_episode(T=20):
+    rng = np.random.default_rng(7)
+    ep = Episode(id="identity-ep", length=T)
+    ep.env_id = "identity-env"
+    ep.observations["state"] = Channel(
+        name="state", dtype=DType.FLOAT32, shape=[4],
+        data=rng.standard_normal((T, 4)).astype(np.float32),
+    )
+    ep.actions["ctrl"] = Channel(
+        name="ctrl", dtype=DType.FLOAT32, shape=[2],
+        data=rng.standard_normal((T, 2)).astype(np.float32),
+    )
+    ep.rewards = Channel(
+        name="reward", dtype=DType.FLOAT32, shape=[],
+        data=rng.standard_normal(T).astype(np.float32),
+    )
+    done = np.zeros(T, dtype=np.uint8)
+    done[-1] = 1
+    ep.terminations = Channel(name="done", dtype=DType.UINT8, shape=[], data=done)
+    return ep
+
+
+class TestIdentity:
+    def test_identity_is_content_not_layout(self, tmp_path):
+        """Same episode under three codecs: disk bytes differ, identity must not.
+        One content change must move it."""
+        ep = _identity_episode()
+        ids = set()
+        for comp in (CompressionType.NONE, CompressionType.ZSTD, CompressionType.LZ4):
+            p = tmp_path / f"{comp.name}.wshard"
+            save_wshard(ep, p, compression=comp)
+            assert verify_identity(p) == episode_identity(p)
+            ids.add(episode_identity(p))
+        assert len(ids) == 1
+        ep.observations["state"].data[0, 0] += 1.0
+        save_wshard(ep, tmp_path / "changed.wshard")
+        assert episode_identity(tmp_path / "changed.wshard") not in ids
+
+    def test_forged_block_passes_crc_but_fails_identity(self, tmp_path):
+        """CRC32C is recomputable by whoever edits the file; the identity is not.
+        Flip a signal byte AND fix its CRC: load_wshard is happy, verify_identity is not."""
+        p = tmp_path / "ep.wshard"
+        save_wshard(_identity_episode(), p)
+        buf = bytearray(p.read_bytes())
+        entry_count = _struct.unpack("<I", buf[12:16])[0]
+        st_off = _struct.unpack("<Q", buf[16:24])[0]
+        for i in range(entry_count):
+            off = HEADER_SIZE + i * INDEX_ENTRY_SIZE
+            e = _parse_index_entry(bytes(buf[off:off + INDEX_ENTRY_SIZE]))
+            name = buf[st_off + e["name_offset"]: st_off + e["name_offset"] + e["name_len"]].decode()
+            if name == "signal/state":
+                buf[e["data_offset"]] ^= 0xFF
+                block = bytes(buf[e["data_offset"]: e["data_offset"] + e["disk_size"]])
+                buf[off + 40: off + 44] = _struct.pack("<I", compute_crc32(block))
+                break
+        else:
+            pytest.fail("signal/state entry not found")
+        p.write_bytes(buf)
+        load_wshard(p)  # CRC matches: the container cannot tell
+        with pytest.raises(ValueError, match="signal/state"):
+            verify_identity(p)

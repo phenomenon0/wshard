@@ -10,6 +10,7 @@ It standardizes three lanes per channel:
 Container format: Shard v2 with role=0x05
 """
 
+import hashlib
 import io
 import json
 import struct
@@ -19,6 +20,7 @@ import numpy as np
 
 import crc32c
 import xxhash
+from glyph import canon_json, from_json_loose, is_canonical
 
 from .types import Episode, Channel, DType, Format, TimebaseSpec, TimebaseType, Residual, Modality
 from .compress import (
@@ -54,6 +56,15 @@ INDEX_ENTRY_SIZE = 48
 
 # Default alignment
 DEFAULT_ALIGNMENT = 32
+
+# Identity leaf map over every other block's uncompressed bytes (glyph
+# SPEC-CANON.md §4): {"v":1,"leaf":"sha256","entries":{name: hex}} as canonical
+# JSON, so sha256(block) == glyph.fingerprint(value). Written last by
+# _encode_wshard. ponytail: flat leaf map; switch to an RFC 6962 tree when a
+# dataset needs O(log n) proofs. streaming.WShardStreamWriter writes no
+# identity yet; add per-block incremental sha256 there when streamed files
+# need one.
+IDENTITY_BLOCK = "meta/identity"
 
 
 def _channel_filter_keep(name: str, allowed: set) -> bool:
@@ -146,8 +157,8 @@ def save_wshard(
         path_or_file.write(data)
 
 
-def _decode_wshard(data: bytes, channels: Optional[List[str]] = None) -> Episode:
-    """Decode W-SHARD binary data to Episode.
+def _read_blocks(data: bytes, channels: Optional[List[str]] = None) -> Dict[str, bytes]:
+    """Read every block of W-SHARD binary data, uncompressed and CRC-verified.
 
     When ``channels`` is provided, ``signal/<id>``, ``action/<id>``, and
     ``residual/<id>/...`` blocks not in the allow-list are skipped. Meta blocks,
@@ -244,7 +255,62 @@ def _decode_wshard(data: bytes, channels: Optional[List[str]] = None) -> Episode
 
         blocks[name] = block_data
 
-    return _episode_from_blocks(blocks)
+    return blocks
+
+
+def _decode_wshard(data: bytes, channels: Optional[List[str]] = None) -> Episode:
+    """Decode W-SHARD binary data to Episode (channels filter: see _read_blocks)."""
+    return _episode_from_blocks(_read_blocks(data, channels))
+
+
+def _identity_leaves(blocks: Dict[str, bytes]) -> Dict[str, str]:
+    return {n: hashlib.sha256(b).hexdigest() for n, b in blocks.items() if n != IDENTITY_BLOCK}
+
+
+def _identity_block(blocks: Dict[str, bytes]) -> bytes:
+    doc = {"v": 1, "leaf": "sha256", "entries": _identity_leaves(blocks)}
+    return canon_json(from_json_loose(doc)).encode("utf-8")
+
+
+def _read_all(path_or_file: Union[str, Path, BinaryIO]) -> bytes:
+    if isinstance(path_or_file, (str, Path)):
+        return Path(path_or_file).read_bytes()
+    return path_or_file.read()
+
+
+def episode_identity(path_or_file: Union[str, Path, BinaryIO]) -> str:
+    """64-hex identity of a W-SHARD file: sha256 of its ``meta/identity`` block.
+
+    Compression, alignment and index layout do not change it; any block's
+    content does. Trusts the block as written — use verify_identity to re-hash.
+    """
+    blocks = _read_blocks(_read_all(path_or_file), channels=[])
+    if IDENTITY_BLOCK not in blocks:
+        raise ValueError("no meta/identity block (written before identity existed?)")
+    return hashlib.sha256(blocks[IDENTITY_BLOCK]).hexdigest()
+
+
+def verify_identity(path_or_file: Union[str, Path, BinaryIO]) -> str:
+    """Re-hash every block and check it against ``meta/identity``; return the identity.
+
+    CRC32C only proves a block matches its own index entry, which whoever edits
+    the file can rewrite. This proves every block matches what the identity
+    committed to. Raises ValueError naming the first block that differs.
+    """
+    blocks = _read_blocks(_read_all(path_or_file))
+    ident = blocks.get(IDENTITY_BLOCK)
+    if ident is None:
+        raise ValueError("no meta/identity block (written before identity existed?)")
+    if not is_canonical(ident):
+        raise ValueError("meta/identity is not canonical JSON")
+    want = json.loads(ident)["entries"]
+    got = _identity_leaves(blocks)
+    for name in sorted(set(want) | set(got)):
+        if want.get(name) != got.get(name):
+            raise ValueError(
+                f"identity mismatch at {name}: committed {want.get(name)}, file has {got.get(name)}"
+            )
+    return hashlib.sha256(ident).hexdigest()
 
 
 def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
@@ -581,6 +647,9 @@ def _encode_wshard(
     # Time ticks
     ticks = np.arange(ep.length, dtype=np.int32)
     blocks["time/ticks"] = ticks.tobytes()
+
+    # Written last: commits to every other block's uncompressed bytes.
+    blocks[IDENTITY_BLOCK] = _identity_block(blocks)
 
     # Sort block names for consistent ordering
     sorted_names = sorted(blocks.keys())
