@@ -59,12 +59,6 @@ def _episode_to_lerobot_table(ep: Episode, fps: float = FPS) -> pa.Table:
     [T, STATE_DIM], and the action channel at ``ep.actions["ctrl"]`` with shape
     [T, ACTION_DIM]. Adjust key names and dims for other environments.
 
-    NOTE: save_wshard does not preserve multi-dim action channel shape in the
-    shard metadata, so actions reload as flat [T*ACTION_DIM]. This function
-    reshapes them using the channel's declared ``shape`` list when available,
-    or falls back to the caller-supplied ``ACTION_DIM`` constant. This is a
-    known library limitation; see ``examples/dreamer_roundtrip.py`` for details.
-
     Args:
         ep: Source episode.
         fps: Frames-per-second used to compute the ``timestamp`` column.
@@ -73,13 +67,7 @@ def _episode_to_lerobot_table(ep: Episode, fps: float = FPS) -> pa.Table:
         PyArrow Table with one row per timestep.
     """
     state = ep.observations["signal"].data   # [T, STATE_DIM]
-    action_raw = ep.actions["ctrl"].data     # [T, ACTION_DIM] or [T*ACTION_DIM] (flat reload)
-
-    # Reshape action if it came back flat (known save_wshard limitation)
-    if action_raw.ndim == 1:
-        action = action_raw.reshape(ep.length, ACTION_DIM)
-    else:
-        action = action_raw
+    action = ep.actions["ctrl"].data         # [T, ACTION_DIM]
 
     reward = ep.rewards.data                 # [T]
     done = ep.terminations.data              # [T]
