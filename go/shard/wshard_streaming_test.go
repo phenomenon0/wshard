@@ -17,7 +17,6 @@ func TestStreamingWriterBasic(t *testing.T) {
 	}
 
 	w, err := NewWShardStreamWriter(path, "stream-001", defs,
-		WithFlushInterval(4),
 		WithMaxTimesteps(100),
 	)
 	if err != nil {
@@ -123,5 +122,23 @@ func TestStreamingWriterCloseWithoutFinalize(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Error("final file should not exist when not finalized")
+	}
+}
+
+// TestWithFlushIntervalRejected pins that the option fails loudly. A block's
+// index entry is a single (offset, size) extent, so a periodic flush would
+// interleave blocks while each extent grew over its neighbours' bytes -- shape,
+// length and CRC all still check out, and the values are another channel's.
+// Accepting the option and ignoring it hands that silence to the caller who
+// asked for durability, so it is an error instead.
+func TestWithFlushIntervalRejected(t *testing.T) {
+	defs := []*WShardChannelDef{{Name: "state", DType: "f32", Shape: []int{2}}}
+	w, err := NewWShardStreamWriter(filepath.Join(t.TempDir(), "e.wshard"),
+		"ep", defs, WithFlushInterval(4))
+	if err == nil {
+		t.Fatal("NewWShardStreamWriter with WithFlushInterval: want error, got nil")
+	}
+	if w != nil {
+		t.Errorf("writer = %v; want nil alongside the error", w)
 	}
 }

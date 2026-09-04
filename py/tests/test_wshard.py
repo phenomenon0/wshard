@@ -1221,6 +1221,111 @@ class TestStreamingAppend:
             path.unlink(missing_ok=True)
 
 
+    def test_flush_interval_rejected(self):
+        """The option fails loudly instead of being accepted and ignored.
+
+        A caller passing flush_interval wants durability partway through an
+        episode. The format cannot give it: each block is one (offset, size)
+        extent, written once at end_episode. Silently ignoring the argument
+        hands that caller a false belief about crash behaviour, so it raises
+        and names the alternative.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "e.wshard"
+            defs = [StreamChannelDef("state", DType.FLOAT32, [2])]
+            with pytest.raises(ValueError, match="flush_interval is not supported"):
+                WShardStreamWriter(path, "ep", defs, flush_interval=4)
+
+    def test_streaming_values_survive_multiple_flushes(self):
+        """Values must round-trip for an episode longer than one flush interval.
+
+        The index describes each block as a single (offset, size) extent, so a
+        block must be written exactly once. When the writer flushed on an
+        interval, every flush appended every non-empty block, so a block's bytes
+        stopped being contiguous while its extent grew over its neighbours'. The
+        byte count still came out right, so T inferred correctly, the reshape
+        succeeded and CRC passed: shape and length were correct while the values
+        were a neighbouring channel's bytes. Shape assertions cannot catch that;
+        only comparing values can, which is why this test exists.
+        """
+        from wshard import WShardStreamWriter, StreamChannelDef
+
+        with tempfile.NamedTemporaryFile(suffix=".wshard", delete=False) as f:
+            path = Path(f.name)
+
+        try:
+            channel_defs = [
+                StreamChannelDef("a", DType.FLOAT32, [2]),
+                StreamChannelDef("b", DType.FLOAT32, [2]),
+            ]
+            writer = WShardStreamWriter(path, "multiflush", channel_defs)
+            # More than one flush interval, and not a multiple of it, so the
+            # final partial flush is exercised too.
+            T = 135  # > 2x the 64-timestep interval that used to flush
+
+            exp_a = np.stack([np.array([t, -t], dtype=np.float32) for t in range(T)])
+            exp_b = np.stack([np.array([1000 + t, 2000 + t], dtype=np.float32) for t in range(T)])
+            exp_r = np.arange(T, dtype=np.float32) * 0.5
+
+            writer.begin_episode(env_id="MultiFlush-v0")
+            for t in range(T):
+                writer.write_timestep(
+                    t=t,
+                    observations={"a": exp_a[t], "b": exp_b[t]},
+                    actions={},
+                    reward=float(exp_r[t]),
+                    done=(t == T - 1),
+                )
+            writer.end_episode()
+
+            loaded = load_wshard(path)
+            assert loaded.length == T
+            np.testing.assert_array_equal(loaded.observations["a"].data, exp_a)
+            np.testing.assert_array_equal(loaded.observations["b"].data, exp_b)
+            np.testing.assert_array_equal(loaded.rewards.data, exp_r)
+            assert loaded.terminations.data[-1] == 1
+            assert not loaded.terminations.data[:-1].any()
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_streaming_compressed_roundtrip(self):
+        """A compressed streamed file must load.
+
+        Streamed meta blocks are the only streamed blocks the compressor is
+        offered, and the index checksum has to describe the same bytes the
+        loader verifies -- the logical, uncompressed payload -- or every
+        compressed streamed file fails its checksum on load.
+        """
+        from wshard import WShardStreamWriter, StreamChannelDef
+        from wshard.compress import CompressionType
+
+        with tempfile.NamedTemporaryFile(suffix=".wshard", delete=False) as f:
+            path = Path(f.name)
+
+        try:
+            channel_defs = [StreamChannelDef("state", DType.FLOAT32, [3])]
+            writer = WShardStreamWriter(
+                path, "compressed-stream", channel_defs,
+                compression=CompressionType.ZSTD,
+            )
+            T = 69  # > the 64-timestep interval that used to flush
+            exp = np.stack([np.full(3, t, dtype=np.float32) for t in range(T)])
+
+            writer.begin_episode(env_id="CompressedStream-v0")
+            for t in range(T):
+                writer.write_timestep(
+                    t=t, observations={"state": exp[t]}, actions={},
+                    reward=0.0, done=(t == T - 1),
+                )
+            writer.end_episode()
+
+            loaded = load_wshard(path)
+            assert loaded.length == T
+            np.testing.assert_array_equal(loaded.observations["state"].data, exp)
+        finally:
+            path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

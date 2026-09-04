@@ -4,9 +4,19 @@ Streaming append-only episode writer for W-SHARD (Gap 4).
 Enables incremental episode building for online learning. Episodes
 build incrementally as the agent acts. Uses a reserve-write-finalize
 pattern: header space is reserved upfront, data is written forward,
-and the header is finalized with a seek-back at the end.
+and the header is finalized with a seek-back at the end. end_episode seals
+the file with meta/identity, and meta/provenance when given one, so a
+streamed episode carries the same guarantees a batch-written one does.
+
+There is no periodic flush. A block's index entry is a single (offset, size)
+extent, so writing a block more than once interleaves it with its neighbours on
+disk while its extent grows over their bytes -- the byte count still comes out
+right, so T infers correctly, the reshape succeeds and CRC passes while the
+values are a neighbouring channel's. flush_interval is therefore rejected
+rather than accepted-and-ignored; Go and TypeScript match.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -17,11 +27,27 @@ from typing import Dict, List, Optional, Any, Union
 import numpy as np
 import xxhash
 
-from .types import Episode, Channel, DType, TimebaseSpec, TimebaseType, Modality
+from .types import (
+    Episode,
+    Channel,
+    DType,
+    TimebaseSpec,
+    TimebaseType,
+    Modality,
+    Provenance,
+)
 from .wshard import (
-    MAGIC, VERSION, ROLE_WSHARD,
-    HEADER_SIZE, INDEX_ENTRY_SIZE, DEFAULT_ALIGNMENT,
+    MAGIC,
+    VERSION,
+    ROLE_WSHARD,
+    HEADER_SIZE,
+    INDEX_ENTRY_SIZE,
+    DEFAULT_ALIGNMENT,
+    IDENTITY_BLOCK,
+    PROVENANCE_BLOCK,
     compute_crc32,
+    _identity_block_from_leaves,
+    _provenance_block,
 )
 from .compress import (
     CompressionType,
@@ -36,14 +62,18 @@ from .compress import (
 FLAG_STREAMING = 0x0040
 
 # Default buffer size before flush
-DEFAULT_FLUSH_INTERVAL = 64
 
 
 class ChannelDef:
     """Channel definition for validation during streaming."""
 
-    def __init__(self, name: str, dtype: DType, shape: List[int],
-                 modality: Optional[Modality] = None):
+    def __init__(
+        self,
+        name: str,
+        dtype: DType,
+        shape: List[int],
+        modality: Optional[Modality] = None,
+    ):
         self.name = name
         self.dtype = dtype
         self.shape = shape
@@ -86,7 +116,7 @@ class WShardStreamWriter:
         max_timesteps: int = 100000,
         compression: CompressionType = CompressionType.NONE,
         compression_level: CompressionLevel = CompressionLevel.DEFAULT,
-        flush_interval: int = DEFAULT_FLUSH_INTERVAL,
+        flush_interval: Optional[int] = None,
     ):
         self.path = Path(path)
         self.episode_id = episode_id
@@ -94,7 +124,13 @@ class WShardStreamWriter:
         self.max_timesteps = max_timesteps
         self.compression = compression
         self.compression_level = compression_level
-        self.flush_interval = flush_interval
+        if flush_interval is not None:
+            raise ValueError(
+                "flush_interval is not supported: a block index entry is a "
+                "single (offset, size) extent, so each block is written "
+                "exactly once, at end_episode(). For crash-durable collection "
+                "write chunk files instead (ChunkedEpisodeWriter)."
+            )
 
         # State
         self._file = None
@@ -134,15 +170,20 @@ class WShardStreamWriter:
             self._timebase = timebase
         self._started = True
 
-        # Estimate max blocks: meta blocks + time + reward + done + channels + actions
-        max_blocks = 4 + 1 + 1 + 1 + len(self.channel_defs) + len(self.channel_defs)
+        # Estimate max blocks: 5 meta (wshard, episode, channels, provenance,
+        # identity) + time + reward + done + channels + actions
+        max_blocks = 5 + 1 + 1 + 1 + len(self.channel_defs) + len(self.channel_defs)
         reserved_index_size = max_blocks * INDEX_ENTRY_SIZE
 
         # String table estimate
-        string_table_estimate = sum(
-            len(f"signal/{name}".encode("utf-8")) + len(f"action/{name}".encode("utf-8"))
-            for name in self.channel_defs
-        ) + 200  # meta blocks + reward + done + time
+        string_table_estimate = (
+            sum(
+                len(f"signal/{name}".encode("utf-8"))
+                + len(f"action/{name}".encode("utf-8"))
+                for name in self.channel_defs
+            )
+            + 200
+        )  # meta blocks + reward + done + time
 
         # Calculate reserved header space
         self._reserved_size = HEADER_SIZE + reserved_index_size + string_table_estimate
@@ -150,7 +191,7 @@ class WShardStreamWriter:
 
         # Validate reserved space can fit expected index
         # Each channel produces signal + action blocks, plus meta/reward/done/time
-        min_blocks = 4 + 1 + 1 + 1 + len(self.channel_defs) * 2
+        min_blocks = 5 + 1 + 1 + 1 + len(self.channel_defs) * 2
         min_header_space = HEADER_SIZE + min_blocks * INDEX_ENTRY_SIZE
         if self._reserved_size < min_header_space:
             raise RuntimeError(
@@ -224,27 +265,31 @@ class WShardStreamWriter:
             )
 
         # Buffer reward and done
-        self._buffers["reward"].extend(
-            np.float32(reward).tobytes()
-        )
-        self._buffers["done"].extend(
-            np.uint8(1 if done else 0).tobytes()
-        )
+        self._buffers["reward"].extend(np.float32(reward).tobytes())
+        self._buffers["done"].extend(np.uint8(1 if done else 0).tobytes())
 
         # Buffer time tick
-        self._buffers["time/ticks"].extend(
-            np.int32(t).tobytes()
-        )
+        self._buffers["time/ticks"].extend(np.int32(t).tobytes())
 
         self._timestep_count += 1
         self._buffered_count += 1
 
-        # Flush buffer if interval reached
-        if self._buffered_count >= self.flush_interval:
-            self._flush_buffers()
-
     def _flush_buffers(self) -> None:
-        """Flush buffered data to disk."""
+        """Write every buffered block out, once, at end_episode.
+
+        Called from end_episode only. It must stay that way: the index
+        describes each block as a single (start_offset, disk_size) extent, but
+        a flush appends every non-empty block in turn, so flushing twice
+        interleaves the channels on disk while each block's extent keeps
+        growing over its neighbours' bytes. The byte count still comes out
+        right, so T infers, the reshape succeeds and CRC passes -- the values
+        are simply another channel's. Go's writer has the same shape and never
+        reads its flush interval either.
+
+        ponytail: the episode buffers whole in RAM, bounded by max_timesteps.
+        Episodes too long for that want chunked.py's chunk files + manifest,
+        which is the real incremental-durability path.
+        """
         if not self._file or self._buffered_count == 0:
             return
 
@@ -252,26 +297,67 @@ class WShardStreamWriter:
             if len(buf) == 0:
                 continue
 
-            # Write to file at current position
-            if block_name not in self._block_positions:
-                self._block_positions[block_name] = {
-                    "start_offset": self._file.tell(),
-                    "total_written": 0,
-                }
-
-            self._file.write(bytes(buf))
-            self._block_positions[block_name]["total_written"] += len(buf)
+            payload = bytes(buf)
+            self._block_positions[block_name] = {
+                "start_offset": self._file.tell(),
+                "total_written": len(payload),
+                # Checksum the logical payload, matching the batch encoder and
+                # what the loader verifies after decompression.
+                "checksum": compute_crc32(payload),
+                # Identity leaf, hashed here because the payload is dropped on
+                # the next line and end_episode needs it to seal the file.
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            self._file.write(payload)
             buf.clear()
 
         self._file.flush()
         self._buffered_count = 0
 
-    def end_episode(self) -> int:
+    def _write_meta_block(self, block_name: str, block_data: bytes) -> None:
+        """Compress if it helps, align, append, and record the block's extent."""
+        pos = self._file.tell()
+
+        disk_data = block_data
+        flags = 0
+        if self._compressor and should_compress(block_name, block_data):
+            compressed = self._compressor.compress(block_data)
+            if len(compressed) < len(block_data):
+                disk_data = compressed
+                flags = BLOCK_FLAG_COMPRESSED
+
+        # Align
+        padding = (DEFAULT_ALIGNMENT - (pos % DEFAULT_ALIGNMENT)) % DEFAULT_ALIGNMENT
+        if padding > 0:
+            self._file.write(b"\x00" * padding)
+            pos += padding
+
+        self._file.write(disk_data)
+        self._block_positions[block_name] = {
+            "start_offset": pos,
+            "total_written": len(disk_data),
+            "orig_size": len(block_data),
+            "flags": flags,
+            # Logical bytes, not disk bytes: the loader checksums after
+            # decompressing, so hashing disk_data fails every compressed block.
+            "checksum": compute_crc32(block_data),
+            # Identity leaf, also over logical bytes, so compression and
+            # alignment cannot change a file's identity.
+            "sha256": hashlib.sha256(block_data).hexdigest(),
+        }
+
+    def end_episode(self, provenance: Optional[Provenance] = None) -> int:
         """
         Finalize the episode.
 
-        Flushes remaining data, writes metadata blocks, then seeks
-        back to write the real header and index.
+        Flushes remaining data, writes metadata blocks, seals the file with
+        ``meta/identity``, then seeks back to write the real header and index.
+
+        Args:
+            provenance: optional run provenance for this episode. Taken here
+                rather than at construction because ``end_state`` and
+                ``last_seq`` are only knowable once the episode has ended.
+                Written before ``meta/identity``, so the identity commits to it.
 
         Returns:
             Total bytes written
@@ -285,37 +371,33 @@ class WShardStreamWriter:
         self._flush_buffers()
 
         # Build metadata blocks and write them at current position
-        meta_blocks = self._build_metadata()
-        for block_name, block_data in meta_blocks.items():
-            pos = self._file.tell()
+        for block_name, block_data in self._build_metadata().items():
+            self._write_meta_block(block_name, block_data)
 
-            # Compress if beneficial
-            disk_data = block_data
-            flags = 0
-            if self._compressor and should_compress(block_name, block_data):
-                compressed = self._compressor.compress(block_data)
-                if len(compressed) < len(block_data):
-                    disk_data = compressed
-                    flags = BLOCK_FLAG_COMPRESSED
+        if provenance is not None:
+            self._write_meta_block(PROVENANCE_BLOCK, _provenance_block(provenance))
 
-            # Align
-            padding = (DEFAULT_ALIGNMENT - (pos % DEFAULT_ALIGNMENT)) % DEFAULT_ALIGNMENT
-            if padding > 0:
-                self._file.write(b"\x00" * padding)
-                pos += padding
-
-            self._file.write(disk_data)
-            self._block_positions[block_name] = {
-                "start_offset": pos,
-                "total_written": len(disk_data),
-                "orig_size": len(block_data),
-                "flags": flags,
-            }
+        # Written last, over every block that now exists, so a streamed file
+        # gets the same identity a batch-written one of the same content would.
+        self._write_meta_block(
+            IDENTITY_BLOCK,
+            _identity_block_from_leaves(
+                {n: bp["sha256"] for n, bp in self._block_positions.items()}
+            ),
+        )
 
         total_size = self._file.tell()
 
-        # Now build the real header + index + string table
-        all_blocks = sorted(self._block_positions.keys())
+        # Now build the real header + index + string table.
+        # Ordered by offset, not by name: blocks are written in buffer order
+        # and the meta blocks land last, so name order puts the index entries
+        # out of ascending-offset order and Go rejects the file outright
+        # ("index corrupt: ... not monotonic"). Lookup is by name hash, so the
+        # entry order is free to follow the disk.
+        all_blocks = sorted(
+            self._block_positions,
+            key=lambda name: self._block_positions[name]["start_offset"],
+        )
 
         # String table
         string_table = bytearray()
@@ -328,7 +410,9 @@ class WShardStreamWriter:
         index_size = entry_count * INDEX_ENTRY_SIZE
         string_table_offset = HEADER_SIZE + index_size
         data_section_offset = string_table_offset + len(string_table)
-        padding = (DEFAULT_ALIGNMENT - (data_section_offset % DEFAULT_ALIGNMENT)) % DEFAULT_ALIGNMENT
+        padding = (
+            DEFAULT_ALIGNMENT - (data_section_offset % DEFAULT_ALIGNMENT)
+        ) % DEFAULT_ALIGNMENT
         data_section_offset += padding
 
         # Check that our header + index + string table fits in reserved space
@@ -360,10 +444,7 @@ class WShardStreamWriter:
             orig_size = bp.get("orig_size", disk_size)
             flags = bp.get("flags", 0)
 
-            # Read the disk data back for checksum
-            self._file.seek(bp["start_offset"])
-            disk_data = self._file.read(disk_size)
-            checksum = compute_crc32(disk_data)
+            checksum = bp["checksum"]
 
             # xxHash64, matching Go's xxhash.Sum64String()
             h = xxhash.xxh64(name.encode("utf-8")).intdigest()
@@ -395,11 +476,28 @@ class WShardStreamWriter:
         self._file.seek(total_size)
         self._file.truncate()
 
+        # Synced before the close, so the rename below only publishes bytes the
+        # disk has actually taken. Otherwise a crash between the two leaves a
+        # file at the final path whose header and index describe data that never
+        # landed, and nothing in the file says so.
+        self._file.flush()
+        os.fsync(self._file.fileno())
         self._file.close()
         self._file = None
 
         # Atomic rename from .partial to final path
         os.replace(str(self._partial_path), str(self.path))
+        # Sync the directory so the rename itself survives a crash. Best effort:
+        # losing it only leaves the .partial behind, which is the safe outcome,
+        # and not every platform lets you open a directory.
+        try:
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
         self._finalized = True
 
         return total_size
@@ -419,7 +517,11 @@ class WShardStreamWriter:
         blocks["meta/wshard"] = json.dumps(meta_wshard).encode("utf-8")
 
         # meta/episode
-        dt_ns = int(1e9 / self._timebase.tick_hz) if self._timebase.tick_hz > 0 else 33333333
+        dt_ns = (
+            int(1e9 / self._timebase.tick_hz)
+            if self._timebase.tick_hz > 0
+            else 33333333
+        )
         meta_episode = {
             "episode_id": self.episode_id,
             "env_id": self._env_id,
@@ -443,7 +545,9 @@ class WShardStreamWriter:
             if ch_def.modality is not None:
                 ch_entry["modality"] = ch_def.modality.value
             channels_list.append(ch_entry)
-        blocks["meta/channels"] = json.dumps({"channels": channels_list}).encode("utf-8")
+        blocks["meta/channels"] = json.dumps({"channels": channels_list}).encode(
+            "utf-8"
+        )
 
         return blocks
 

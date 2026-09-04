@@ -1,8 +1,16 @@
 /**
- * Streaming append-only episode writer for W-SHARD (Gap 4).
+ * Streaming episode writer for W-SHARD (Gap 4).
  *
- * Enables incremental episode building for online learning.
- * Uses a reserve-write-finalize pattern.
+ * Enables incremental episode building for online learning. Data is buffered
+ * in memory for the whole episode and written once on endEpisode(), using a
+ * reserve-write-finalize pattern.
+ *
+ * There is no periodic flush. A block's index entry is a single
+ * (offset, size) extent, so writing a block more than once interleaves it with
+ * its neighbours on disk while its extent grows over their bytes -- the byte
+ * count still comes out right, so T infers correctly, the reshape succeeds and
+ * CRC passes while the values are a neighbouring channel's. flushInterval is
+ * therefore rejected rather than accepted-and-ignored; Go and Python match.
  */
 
 import * as fs from 'fs';
@@ -28,9 +36,6 @@ import { Compressor, shouldCompress } from './compress.js';
 
 // Header flag indicating streaming file
 const FLAG_STREAMING = 0x0040;
-
-// Default buffer flush interval (timesteps)
-const DEFAULT_FLUSH_INTERVAL = 64;
 
 /**
  * Channel definition for shape validation during streaming.
@@ -60,7 +65,6 @@ export class WShardStreamWriter {
   private maxTimesteps: number;
   private compression: CompressionType;
   private compressionLevel: CompressionLevel;
-  private flushInterval: number;
 
   // State
   private fd: number | null = null;
@@ -87,6 +91,7 @@ export class WShardStreamWriter {
       maxTimesteps?: number;
       compression?: CompressionType;
       compressionLevel?: CompressionLevel;
+      /** @deprecated Not supported -- throws. See the note at the top of this file. */
       flushInterval?: number;
     } = {},
   ) {
@@ -97,7 +102,13 @@ export class WShardStreamWriter {
     this.maxTimesteps = options.maxTimesteps ?? 100000;
     this.compression = options.compression ?? 'none';
     this.compressionLevel = options.compressionLevel ?? 'default';
-    this.flushInterval = options.flushInterval ?? DEFAULT_FLUSH_INTERVAL;
+    if (options.flushInterval !== undefined) {
+      throw new Error(
+        'flushInterval is not supported: a block index entry is a single ' +
+        '(offset, size) extent, so each block is written exactly once, at ' +
+        'endEpisode(). For crash-durable collection write chunk files instead.',
+      );
+    }
   }
 
   /**
@@ -193,10 +204,6 @@ export class WShardStreamWriter {
 
     this.timestepCount++;
     this.bufferedCount++;
-
-    if (this.bufferedCount >= this.flushInterval) {
-      this.flushBuffers();
-    }
   }
 
   /**
