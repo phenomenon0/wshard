@@ -75,14 +75,11 @@ def test_dreamer_v3_npz_to_wshard_roundtrip(tmp_path):
         assert orig.tobytes() == got.tobytes(), \
             f"observation {name!r} byte content mismatch (shapes: {orig.shape} vs {got.shape})"
 
-    # All actions byte-identical.
-    # Known limitation: save_wshard does not store action channel shape in
-    # meta/channels, so multi-dim actions reload with shape=[] (flat). The
-    # raw bytes are intact; compare via tobytes().
+    # All actions byte-identical, shape included.
     for name in ep.actions:
         assert name in ep2.actions, f"action {name!r} missing after reload"
-        assert ep.actions[name].data.tobytes() == ep2.actions[name].data.tobytes(), \
-            f"action {name!r} byte content mismatch after wshard round-trip"
+        assert np.array_equal(ep.actions[name].data, ep2.actions[name].data), \
+            f"action {name!r} data mismatch after wshard round-trip"
 
     # Rewards byte-identical
     if ep.rewards is not None:
@@ -100,10 +97,12 @@ def test_dreamer_v3_npz_to_wshard_roundtrip(tmp_path):
 
     # Image shape sanity (observations preserve shape through meta/channels)
     assert ep2.observations["image"].data.shape == (T, 64, 64, 3)
-    # Action shape is NOT preserved through save_wshard/load_wshard (known limitation):
-    # save_wshard omits action channels from meta/channels, so they reload flat.
-    # Byte content is intact — shape must be re-applied by the caller.
-    assert ep2.actions["action"].data.size == T * 6
+    # Actions preserve shape the same way: load_dreamer declares Channel.shape
+    # from the NPZ's trailing dims and save_wshard writes it to meta/channels.
+    # Asserting .size alone would pass on a flat reload, which is what this
+    # test used to do while the docstring claimed the shape was lost.
+    assert ep2.actions["action"].shape == [6]
+    assert ep2.actions["action"].data.shape == (T, 6)
 
 
 def test_dreamer_v3_save_load_self_consistent(tmp_path):

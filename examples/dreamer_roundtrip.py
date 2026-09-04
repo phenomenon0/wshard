@@ -79,14 +79,16 @@ def main(tmp_dir: str = "/tmp") -> None:
         assert np.array_equal(ep.observations[name].data, ep2.observations[name].data), \
             f"observation {name!r} data mismatch"
 
-    # 6. Assert all actions are byte-identical.
-    # Known limitation: save_wshard does not write action channel shape into
-    # meta/channels, so multi-dim actions are reloaded with shape=[] (flat).
-    # The raw bytes are identical; compare via tobytes().
+    # 6. Assert all actions are byte-identical, shape included. load_dreamer
+    # declares Channel.shape from the NPZ's trailing dims, and save_wshard
+    # writes that declaration into meta/channels, so a [T, 6] action reloads
+    # as [T, 6] -- compare with array_equal, not tobytes().
     for name in ep.actions:
         assert name in ep2.actions, f"action {name!r} missing after reload"
-        assert ep.actions[name].data.tobytes() == ep2.actions[name].data.tobytes(), \
-            f"action {name!r} byte content mismatch"
+        assert ep.actions[name].shape == ep2.actions[name].shape, \
+            f"action {name!r} declared shape changed"
+        assert np.array_equal(ep.actions[name].data, ep2.actions[name].data), \
+            f"action {name!r} data mismatch"
 
     # 7. Rewards
     if ep.rewards is not None:
@@ -103,9 +105,7 @@ def main(tmp_dir: str = "/tmp") -> None:
     print(f"  episode id       : {ep.id!r} -> {ep2.id!r}")
     print(f"  length           : {ep.length} == {ep2.length}")
     print(f"  image shape      : {ep.observations['image'].data.shape}")
-    print(f"  action bytes     : {ep.actions['action'].data.tobytes()[:8].hex()}...  (shape lost; known limitation)")
-    print("NOTE: save_wshard does not preserve action channel shape in meta/channels.")
-    print("      Action data bytes are correct; shape must be re-applied by the caller.")
+    print(f"  action shape     : {ep.actions['action'].data.shape} -> {ep2.actions['action'].data.shape}")
 
 
 if __name__ == "__main__":

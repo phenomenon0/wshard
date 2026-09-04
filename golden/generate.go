@@ -60,6 +60,42 @@ func sha256hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// metaWShardBlock is meta/wshard. One key set for every writer of this format —
+// the block is a leaf in meta/identity, so a key one writer emits and another
+// omits gives two identities for one episode. Nothing here names the writer or
+// the container layout (alignment lives in the header, and identity is
+// alignment-invariant); this generator writes at align64 and still agrees with
+// the align32 writers.
+func metaWShardBlock() []byte {
+	b, _ := json.Marshal(map[string]any{
+		"endianness":     "little",
+		"format":         "W-SHARD",
+		"residual_edges": "pad",
+		"version":        "0.1",
+	})
+	return b
+}
+
+// tickTimebase is meta/episode's timebase sub-object. Both tick_hz and dt_ns:
+// dt_ns alone loses the rate (33333333 ns reads back as 30.0000003 Hz), and a
+// reader that reconstructs a different tick_hz reseals a different identity.
+func tickTimebase(tickHz float64) map[string]any {
+	return map[string]any{
+		"type":    "ticks",
+		"tick_hz": tickHz,
+		"dt_ns":   int64(math.Round(1e9 / tickHz)),
+	}
+}
+
+// tickBytes is time/ticks: 0..T-1 as int32 little-endian.
+func tickBytes(T int) []byte {
+	buf := make([]byte, T*4)
+	for i := 0; i < T; i++ {
+		binary.LittleEndian.PutUint32(buf[i*4:], uint32(int32(i)))
+	}
+	return buf
+}
+
 // identityBlock is the meta/identity entry (glyph SPEC-CANON.md §4): every
 // other entry's uncompressed sha256 as canonical JSON. Independent of the
 // shard package on purpose, like the rest of this writer.
@@ -331,19 +367,15 @@ func genSimpleEpisode(dir string) error {
 	w := &shardWriter{align: align64, compDef: compressNone}
 
 	// meta/wshard
-	metaWShard, _ := json.Marshal(map[string]any{
-		"version":  1,
-		"timebase": map[string]any{"type": "ticks", "tick_hz": 30.0},
-	})
+	metaWShard := metaWShardBlock()
 	w.addEntry("meta/wshard", metaWShard, contentTypeJSON)
 
 	// meta/episode — keys must match Python convention exactly
 	metaEp, _ := json.Marshal(map[string]any{
-		"episode_id":     "golden_simple",
-		"env_id":         "TestEnv-v1",
-		"length_T":       T,
-		"timestep_range": [2]int{0, T},
-		"timebase":       map[string]any{"type": "ticks", "dt_ns": 33333333},
+		"episode_id": "golden_simple",
+		"env_id":     "TestEnv-v1",
+		"length_T":   T,
+		"timebase":   tickTimebase(30.0),
 	})
 	w.addEntry("meta/episode", metaEp, contentTypeJSON)
 
@@ -390,6 +422,8 @@ func genSimpleEpisode(dir string) error {
 	done[T-1] = true
 	w.addEntry("done", boolBytes(done), 0)
 
+	w.addEntry("time/ticks", tickBytes(T), 0)
+
 	return w.writeTo(filepath.Join(dir, "simple_episode.wshard"))
 }
 
@@ -402,30 +436,29 @@ func genDtypeZoo(dir string) error {
 	w := &shardWriter{align: align64, compDef: compressNone}
 
 	// meta/wshard
-	metaWShard, _ := json.Marshal(map[string]any{
-		"version":  1,
-		"timebase": map[string]any{"type": "ticks", "tick_hz": 1.0},
-	})
+	metaWShard := metaWShardBlock()
 	w.addEntry("meta/wshard", metaWShard, contentTypeJSON)
 
 	// meta/episode
 	metaEp, _ := json.Marshal(map[string]any{
-		"episode_id":     "golden_dtypes",
-		"env_id":         "DtypeTestEnv-v0",
-		"length_T":       T,
-		"timestep_range": [2]int{0, T},
-		"timebase":       map[string]any{"type": "ticks", "dt_ns": 1000000000},
+		"episode_id": "golden_dtypes",
+		"env_id":     "DtypeTestEnv-v0",
+		"length_T":   T,
+		"timebase":   tickTimebase(1.0),
 	})
 	w.addEntry("meta/episode", metaEp, contentTypeJSON)
 
 	// meta/channels — list format matching Python
 	chanJSON, _ := json.Marshal(map[string]any{
 		"channels": []map[string]any{
+			// Sorted by channel id within each group (signal, then action, then
+			// omen, then uncert). Authoring order would record how this file was
+			// written, and meta/channels is in the seal.
+			{"id": "bf16_ch", "dtype": "bf16", "shape": []int{1}, "signal_block": "signal/bf16_ch"},
 			{"id": "f32_ch", "dtype": "f32", "shape": []int{1}, "signal_block": "signal/f32_ch"},
 			{"id": "f64_ch", "dtype": "f64", "shape": []int{1}, "signal_block": "signal/f64_ch"},
 			{"id": "i32_ch", "dtype": "i32", "shape": []int{1}, "signal_block": "signal/i32_ch"},
 			{"id": "u8_ch", "dtype": "u8", "shape": []int{1}, "signal_block": "signal/u8_ch"},
-			{"id": "bf16_ch", "dtype": "bf16", "shape": []int{1}, "signal_block": "signal/bf16_ch"},
 		},
 	})
 	w.addEntry("meta/channels", chanJSON, contentTypeJSON)
@@ -453,6 +486,8 @@ func genDtypeZoo(dir string) error {
 	done[T-1] = true
 	w.addEntry("done", boolBytes(done), 0)
 
+	w.addEntry("time/ticks", tickBytes(T), 0)
+
 	return w.writeTo(filepath.Join(dir, "dtype_zoo.wshard"))
 }
 
@@ -465,19 +500,15 @@ func genCompressed(dir string) error {
 	w := &shardWriter{align: align64, compDef: compressZstd}
 
 	// meta/wshard
-	metaWShard, _ := json.Marshal(map[string]any{
-		"version":  1,
-		"timebase": map[string]any{"type": "ticks", "tick_hz": 60.0},
-	})
+	metaWShard := metaWShardBlock()
 	w.addEntry("meta/wshard", metaWShard, contentTypeJSON)
 
 	// meta/episode
 	metaEp, _ := json.Marshal(map[string]any{
-		"episode_id":     "golden_compressed",
-		"env_id":         "CompressTestEnv-v0",
-		"length_T":       T,
-		"timestep_range": [2]int{0, T},
-		"timebase":       map[string]any{"type": "ticks", "dt_ns": 16666667},
+		"episode_id": "golden_compressed",
+		"env_id":     "CompressTestEnv-v0",
+		"length_T":   T,
+		"timebase":   tickTimebase(60.0),
 	})
 	w.addEntry("meta/episode", metaEp, contentTypeJSON)
 
@@ -510,6 +541,8 @@ func genCompressed(dir string) error {
 	done[T-1] = true
 	w.addEntry("done", boolBytes(done), 0)
 
+	w.addEntry("time/ticks", tickBytes(T), 0)
+
 	return w.writeTo(filepath.Join(dir, "per_block_compressed.wshard"))
 }
 
@@ -522,19 +555,14 @@ func genOmenUncert(dir string) error {
 	const T = 10
 	w := &shardWriter{align: align64, compDef: compressNone}
 
-	metaWShard, _ := json.Marshal(map[string]any{
-		"version":        1,
-		"residual_edges": "pad",
-		"timebase":       map[string]any{"type": "ticks", "tick_hz": 30.0},
-	})
+	metaWShard := metaWShardBlock()
 	w.addEntry("meta/wshard", metaWShard, contentTypeJSON)
 
 	metaEp, _ := json.Marshal(map[string]any{
-		"episode_id":     "golden_omen_uncert",
-		"env_id":         "OmenTestEnv-v1",
-		"length_T":       T,
-		"timestep_range": [2]int{0, T},
-		"timebase":       map[string]any{"type": "ticks", "dt_ns": 33333333},
+		"episode_id": "golden_omen_uncert",
+		"env_id":     "OmenTestEnv-v1",
+		"length_T":   T,
+		"timebase":   tickTimebase(30.0),
 	})
 	w.addEntry("meta/episode", metaEp, contentTypeJSON)
 
@@ -542,6 +570,10 @@ func genOmenUncert(dir string) error {
 		"channels": []map[string]any{
 			{"id": "joint_pos", "dtype": "f32", "shape": []int{3}, "signal_block": "signal/joint_pos"},
 			{"id": "torque", "dtype": "f32", "shape": []int{3}, "signal_block": "action/torque"},
+			// omen/ and uncert/ blocks are bare tensor bytes; this is where their
+			// dtype and shape are declared, in block-name order.
+			{"id": "omen/joint_pos/dreamer", "dtype": "f32", "shape": []int{3}, "signal_block": "omen/joint_pos/dreamer"},
+			{"id": "uncert/joint_pos/dreamer/variance", "dtype": "f32", "shape": []int{3}, "signal_block": "uncert/joint_pos/dreamer/variance"},
 		},
 	})
 	w.addEntry("meta/channels", chanJSON, contentTypeJSON)
@@ -571,6 +603,8 @@ func genOmenUncert(dir string) error {
 	done := make([]bool, T)
 	done[T-1] = true
 	w.addEntry("done", boolBytes(done), 0)
+
+	w.addEntry("time/ticks", tickBytes(T), 0)
 
 	// omen/joint_pos/dreamer — model prediction
 	omenData := make([]float32, T*3)
@@ -619,26 +653,22 @@ func genMultiModal(dir string) error {
 	const T = 5
 	w := &shardWriter{align: align64, compDef: compressNone}
 
-	metaWShard, _ := json.Marshal(map[string]any{
-		"version":  1,
-		"timebase": map[string]any{"type": "ticks", "tick_hz": 10.0},
-	})
+	metaWShard := metaWShardBlock()
 	w.addEntry("meta/wshard", metaWShard, contentTypeJSON)
 
 	metaEp, _ := json.Marshal(map[string]any{
-		"episode_id":     "golden_multimodal",
-		"env_id":         "VLAEnv-v1",
-		"length_T":       T,
-		"timestep_range": [2]int{0, T},
-		"timebase":       map[string]any{"type": "ticks", "dt_ns": 100000000},
+		"episode_id": "golden_multimodal",
+		"env_id":     "VLAEnv-v1",
+		"length_T":   T,
+		"timebase":   tickTimebase(10.0),
 	})
 	w.addEntry("meta/episode", metaEp, contentTypeJSON)
 
 	chanJSON, _ := json.Marshal(map[string]any{
 		"channels": []map[string]any{
-			{"id": "obs/rgb", "dtype": "u8", "shape": []int{8, 8, 3}, "signal_block": "signal/obs/rgb", "modality": "rgb"},
 			{"id": "obs/depth", "dtype": "f32", "shape": []int{8, 8}, "signal_block": "signal/obs/depth", "modality": "depth"},
 			{"id": "obs/proprioception", "dtype": "f32", "shape": []int{7}, "signal_block": "signal/obs/proprioception", "modality": "proprioception"},
+			{"id": "obs/rgb", "dtype": "u8", "shape": []int{8, 8, 3}, "signal_block": "signal/obs/rgb", "modality": "rgb"},
 			{"id": "ctrl", "dtype": "f32", "shape": []int{3}, "signal_block": "action/ctrl"},
 		},
 	})
@@ -680,6 +710,8 @@ func genMultiModal(dir string) error {
 	done[T-1] = true
 	w.addEntry("done", boolBytes(done), 0)
 
+	w.addEntry("time/ticks", tickBytes(T), 0)
+
 	return w.writeTo(filepath.Join(dir, "multimodal.wshard"))
 }
 
@@ -692,24 +724,22 @@ func genLatentAction(dir string) error {
 	const T = 8
 	w := &shardWriter{align: align64, compDef: compressNone}
 
-	metaWShard, _ := json.Marshal(map[string]any{
-		"version":  1,
-		"timebase": map[string]any{"type": "ticks", "tick_hz": 30.0},
-	})
+	metaWShard := metaWShardBlock()
 	w.addEntry("meta/wshard", metaWShard, contentTypeJSON)
 
 	metaEp, _ := json.Marshal(map[string]any{
-		"episode_id":     "golden_latent_action",
-		"env_id":         "LatentEnv-v1",
-		"length_T":       T,
-		"timestep_range": [2]int{0, T},
-		"timebase":       map[string]any{"type": "ticks", "dt_ns": 33333333},
+		"episode_id": "golden_latent_action",
+		"env_id":     "LatentEnv-v1",
+		"length_T":   T,
+		"timebase":   tickTimebase(30.0),
 	})
 	w.addEntry("meta/episode", metaEp, contentTypeJSON)
 
 	chanJSON, _ := json.Marshal(map[string]any{
 		"channels": []map[string]any{
 			{"id": "state", "dtype": "f32", "shape": []int{4}, "signal_block": "signal/state"},
+			{"id": "omen/latent_action/genie3", "dtype": "f32", "shape": []int{16}, "signal_block": "omen/latent_action/genie3"},
+			{"id": "omen/latent_action_codebook/genie3", "dtype": "i32", "shape": []int{}, "signal_block": "omen/latent_action_codebook/genie3"},
 		},
 	})
 	w.addEntry("meta/channels", chanJSON, contentTypeJSON)
@@ -728,6 +758,8 @@ func genLatentAction(dir string) error {
 	done := make([]bool, T)
 	done[T-1] = true
 	w.addEntry("done", boolBytes(done), 0)
+
+	w.addEntry("time/ticks", tickBytes(T), 0)
 
 	// omen/latent_action/genie3 — continuous latent embeddings [T, 16]
 	latentData := make([]float32, T*16)

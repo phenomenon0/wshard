@@ -51,6 +51,11 @@ from .residual import (
     HAS_COWRIE,
 )
 
+# meta/wshard's "version". Distinct from VERSION below, which is the binary
+# container revision in the header; this one names the metadata schema and must
+# match what the Go writer emits, since it is inside the seal.
+WSHARD_VERSION = "0.1"
+
 # Residual encoding identifiers
 RESIDUAL_ENCODING_RAW = "raw"
 RESIDUAL_ENCODING_COWRIE_BITMASK = "cowrie_bitmask"
@@ -97,13 +102,13 @@ def _channel_filter_keep(name: str, allowed: set) -> bool:
         return True
     if name in ("reward", "done"):
         return True
-    for lane in ("signal/", "action/", "omen/", "uncert/"):
+    # signal/<id> and action/<id> are one segment; omen/<id>/<model>,
+    # uncert/<id>/<model>/<type> and residual/<id>/... carry the channel id in
+    # the first segment and model/type after it. Comparing the whole remainder
+    # dropped every omen and uncert block under a channels= filter.
+    for lane in ("signal/", "action/", "omen/", "uncert/", "residual/"):
         if name.startswith(lane):
-            return name[len(lane) :] in allowed
-    if name.startswith("residual/"):
-        rest = name[len("residual/") :]
-        ch_id = rest.split("/", 1)[0]
-        return ch_id in allowed
+            return name[len(lane) :].split("/", 1)[0] in allowed
     # Unknown prefix: keep to be safe.
     return True
 
@@ -325,6 +330,37 @@ def _provenance_block(prov: Provenance) -> bytes:
     return canon_json(from_json_loose(doc)).encode("utf-8")
 
 
+def _meta_block(doc: Dict[str, Any]) -> bytes:
+    """Serialize a metadata block for the leaf map, canonically.
+
+    Every block ``meta/identity`` commits to has to be byte-identical across
+    writers and languages, or two implementations compute two identities for
+    one episode and the identity stops meaning "this content". ``json.dumps``
+    is not that: it keeps insertion order and emits ``", "`` where Go's
+    ``json.Marshal`` sorts keys and emits ``","``. Same document, different
+    hash. This is the same path ``meta/provenance`` has always used.
+    """
+    return canon_json(from_json_loose(doc)).encode("utf-8")
+
+
+def _timebase_meta(tb: TimebaseSpec) -> Dict[str, Any]:
+    """The ``timebase`` sub-object of ``meta/episode``, as Go writes it.
+
+    Carries ``tick_hz`` as well as ``dt_ns``: both writers have to emit the same
+    keys or the block hashes differently, and ``tick_hz`` is the lossless one of
+    the pair -- 30 Hz round-trips through ``dt_ns`` as 30.0000003. Mirrors
+    ``episodeTimebaseMeta`` in go/shard/wshard.go, down to omitting ``tick_hz``
+    when it is unset.
+    """
+    meta: Dict[str, Any] = {"type": tb.type.value}
+    if tb.type == TimebaseType.TICKS and tb.tick_hz > 0:
+        meta["tick_hz"] = tb.tick_hz
+        meta["dt_ns"] = round(1e9 / tb.tick_hz)
+    else:
+        meta["dt_ns"] = 33333333
+    return meta
+
+
 def _check_str(field: str, value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError(
@@ -450,9 +486,7 @@ def verify_identity(
     if expected is not None:
         expected = expected.strip().lower()
         if len(expected) != 64 or not all(c in "0123456789abcdef" for c in expected):
-            raise ValueError(
-                f"expected must be 64 hex characters, got {expected!r}"
-            )
+            raise ValueError(f"expected must be 64 hex characters, got {expected!r}")
     blocks = _read_blocks(_read_all(path_or_file))
     ident = blocks.get(IDENTITY_BLOCK)
     if ident is None:
@@ -509,8 +543,17 @@ def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
     tb_type = timebase_meta.get("type", "ticks")
     if tb_type == "ticks":
         ep.timebase.type = TimebaseType.TICKS
+        # tick_hz first, dt_ns only as the fallback -- matching Go's
+        # wshardTimebaseJ.toPublic. Deriving from dt_ns when tick_hz is right
+        # there loses precision (30 Hz -> 33333333 ns -> 30.0000003), and since
+        # the writer puts tick_hz back into the seal, that made load -> save
+        # change a file's identity.
+        tick_hz = timebase_meta.get("tick_hz", 0)
         dt_ns = timebase_meta.get("dt_ns", 33333333)
-        ep.timebase.tick_hz = 1e9 / dt_ns if dt_ns > 0 else 30.0
+        if tick_hz > 0:
+            ep.timebase.tick_hz = tick_hz
+        else:
+            ep.timebase.tick_hz = 1e9 / dt_ns if dt_ns > 0 else 30.0
     elif tb_type == "timestamps_ns":
         ep.timebase.type = TimebaseType.TIMESTAMPS_NS
 
@@ -533,6 +576,8 @@ def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
                     ch.sampling_rate_hz = ch_def["sampling_rate_hz"]
                 if "content_type" in ch_def:
                     ch.content_type = ch_def["content_type"]
+                if signal_block.startswith(("omen/", "uncert/")):
+                    continue  # routed below, into ep.omens / ep.uncerts
                 if signal_block.startswith("action/"):
                     ep.actions[ch_id] = ch
                     meta_parsed_actions.add(signal_block)
@@ -566,10 +611,10 @@ def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
         ep.terminations.data = ep.terminations.data.astype(np.bool_)
         ep.terminations.dtype = DType.BOOL
 
-    # Omen blocks: omen/{channel_id}/{model_id}. Files written by this module
-    # carry dtype/shape in meta/wshard's omen_channels; Go-written files do not,
-    # so fall back to raw uint8 bytes rather than guessing a dtype.
-    omen_defs = {d["block"]: d for d in meta_wshard.get("omen_channels", [])}
+    # Omen blocks: omen/{channel_id}/{model_id}. dtype/shape come from
+    # meta/channels; a file whose writer declared neither falls back to raw
+    # uint8 bytes rather than guessing a dtype.
+    chan_defs = {d.get("signal_block", d.get("id")): d for d in channels_list}
     for name, block_data in blocks.items():
         if not name.startswith("omen/"):
             continue
@@ -577,7 +622,7 @@ def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
         if len(parts) != 2:
             continue
         ch_id, model_id = parts
-        omen_def = omen_defs.get(name)
+        omen_def = chan_defs.get(name)
         if omen_def is not None:
             ch = _parse_tensor_block(
                 block_data,
@@ -595,6 +640,34 @@ def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
                 data=np.frombuffer(block_data, dtype=np.uint8),
             )
         ep.omens.setdefault(ch_id, {})[model_id] = ch
+
+    # Uncert blocks: uncert/{channel_id}/{model_id}/{uncert_type}. Same
+    # dtype/shape story as omens.
+    for name, block_data in blocks.items():
+        if not name.startswith("uncert/"):
+            continue
+        parts = name[len("uncert/") :].split("/")
+        if len(parts) != 3:
+            continue
+        ch_id, model_id, uncert_type = parts
+        d = chan_defs.get(name)
+        if d is not None:
+            ch = _parse_tensor_block(
+                block_data,
+                {
+                    "id": name,
+                    "dtype": d.get("dtype", "f32"),
+                    "shape": d.get("shape", []),
+                },
+            )
+        else:
+            ch = Channel(
+                name=name,
+                dtype=DType.UINT8,
+                shape=[],
+                data=np.frombuffer(block_data, dtype=np.uint8),
+            )
+        ep.uncerts.setdefault(ch_id, {}).setdefault(model_id, {})[uncert_type] = ch
 
     residual_encoding = meta_wshard.get("residual_encoding", RESIDUAL_ENCODING_RAW)
 
@@ -695,42 +768,25 @@ def _encode_wshard(
     blocks = {}
 
     # Meta/wshard
+    # Keys agreed with the Go writer. Nothing here may depend on which writer
+    # ran or what was importable when it did: this block is inside the seal, so
+    # an install-dependent key makes the identity install-dependent too. That
+    # is what the dropped "residual_encoding" (it tracked HAS_COWRIE, and both
+    # decode branches were the same call) and "streaming" did.
     meta_wshard = {
         "format": "W-SHARD",
-        "wshard_version": "0.1",
+        "version": WSHARD_VERSION,
         "endianness": "little",
-        "alignment": 32,
-        "residual_encoding": RESIDUAL_ENCODING_COWRIE_BITMASK
-        if HAS_COWRIE
-        else RESIDUAL_ENCODING_RAW,
+        "residual_edges": "pad",
     }
-    # Omen blocks are raw tensor bytes on disk (matching the Go writer, which
-    # records no dtype/shape for them). Record dtype/shape here so the Python
-    # decoder can reconstruct typed channels; Go ignores the extra key.
-    omen_channel_defs = []
-    for ch_id, models in ep.omens.items():
-        for model_id, ch in models.items():
-            omen_channel_defs.append(
-                {
-                    "block": f"omen/{ch_id}/{model_id}",
-                    "dtype": ch.dtype.value,
-                    "shape": ch.shape,
-                }
-            )
-    if omen_channel_defs:
-        meta_wshard["omen_channels"] = omen_channel_defs
-    blocks["meta/wshard"] = json.dumps(meta_wshard).encode("utf-8")
+    blocks["meta/wshard"] = _meta_block(meta_wshard)
 
     # Meta/episode
-    dt_ns = int(1e9 / ep.timebase.tick_hz) if ep.timebase.tick_hz > 0 else 33333333
     meta_episode: Dict[str, Any] = {
         "episode_id": ep.id,
         "env_id": ep.env_id,
         "length_T": ep.length,
-        "timebase": {
-            "type": ep.timebase.type.value,
-            "dt_ns": dt_ns,
-        },
+        "timebase": _timebase_meta(ep.timebase),
     }
     # Gap 1: Chunked episode fields (optional, backward compat)
     if ep.chunk_index is not None:
@@ -738,52 +794,55 @@ def _encode_wshard(
         meta_episode["total_chunks"] = ep.total_chunks
     if ep.timestep_range is not None:
         meta_episode["timestep_range"] = ep.timestep_range
-    blocks["meta/episode"] = json.dumps(meta_episode).encode("utf-8")
+    blocks["meta/episode"] = _meta_block(meta_episode)
 
-    # Meta/channels — include modality info (Gap 5) if present
-    channels_list = []
-    modality_groups: Dict[str, list] = {}
-    for name, ch in ep.observations.items():
-        ch_def: Dict[str, Any] = {
-            "id": name,
+    # Meta/channels. Sorted by block name, and the sole home for every channel's
+    # dtype/shape -- including omen/ and uncert/, whose blocks are bare tensor
+    # bytes on disk. Sorted because the alternative is dict insertion order,
+    # which records how the caller built the episode; the block is in the seal,
+    # so that would give one episode two identities. Nothing derived goes in
+    # here: content_type_code was a copy of modality's code and modality_groups
+    # a regrouping of this same list, neither read by any implementation.
+    def _ch_def(ch_id: str, block: str, ch: Channel) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "id": ch_id,
             "dtype": ch.dtype.value,
             "shape": ch.shape,
-            "signal_block": f"signal/{name}",
+            "signal_block": block,
         }
         if ch.modality is not None:
-            ch_def["modality"] = ch.modality.value
-            ch_def["content_type_code"] = ch.modality.content_type
+            d["modality"] = ch.modality.value
         if ch.sampling_rate_hz is not None:
-            ch_def["sampling_rate_hz"] = ch.sampling_rate_hz
+            d["sampling_rate_hz"] = ch.sampling_rate_hz
         if ch.content_type is not None:
-            ch_def["content_type"] = ch.content_type
-        channels_list.append(ch_def)
-        # Build modality_groups index
-        if ch.modality is not None:
-            parts = name.split("/")
-            group = parts[0] if len(parts) > 1 else "default"
-            modality_groups.setdefault(group, []).append(
-                {"channel_id": name, "modality": ch.modality.value}
-            )
-    for name, ch in ep.actions.items():
-        ch_def = {
-            "id": name,
-            "dtype": ch.dtype.value,
-            "shape": ch.shape,
-            "signal_block": f"action/{name}",
-        }
-        if ch.modality is not None:
-            ch_def["modality"] = ch.modality.value
-            ch_def["content_type_code"] = ch.modality.content_type
-        if ch.sampling_rate_hz is not None:
-            ch_def["sampling_rate_hz"] = ch.sampling_rate_hz
-        if ch.content_type is not None:
-            ch_def["content_type"] = ch.content_type
-        channels_list.append(ch_def)
-    meta_channels: Dict[str, Any] = {"channels": channels_list}
-    if modality_groups:
-        meta_channels["modality_groups"] = modality_groups
-    blocks["meta/channels"] = json.dumps(meta_channels).encode("utf-8")
+            d["content_type"] = ch.content_type
+        return d
+
+    channels_list = [
+        _ch_def(name, f"signal/{name}", ep.observations[name])
+        for name in sorted(ep.observations)
+    ]
+    channels_list += [
+        _ch_def(name, f"action/{name}", ep.actions[name]) for name in sorted(ep.actions)
+    ]
+    omen_blocks = {
+        f"omen/{ch_id}/{model_id}": ch
+        for ch_id, models in ep.omens.items()
+        for model_id, ch in models.items()
+    }
+    channels_list += [
+        _ch_def(block, block, omen_blocks[block]) for block in sorted(omen_blocks)
+    ]
+    uncert_blocks = {
+        f"uncert/{ch_id}/{model_id}/{utype}": ch
+        for ch_id, models in ep.uncerts.items()
+        for model_id, types in models.items()
+        for utype, ch in types.items()
+    }
+    channels_list += [
+        _ch_def(block, block, uncert_blocks[block]) for block in sorted(uncert_blocks)
+    ]
+    blocks["meta/channels"] = _meta_block({"channels": channels_list})
 
     # Signal blocks (observations)
     for name, ch in ep.observations.items():
@@ -805,6 +864,12 @@ def _encode_wshard(
     for ch_id, models in ep.omens.items():
         for model_id, ch in models.items():
             blocks[f"omen/{ch_id}/{model_id}"] = _encode_tensor(ch)
+
+    # Uncert blocks: uncert/{channel_id}/{model_id}/{uncert_type}
+    for ch_id, models in ep.uncerts.items():
+        for model_id, types in models.items():
+            for utype, ch in types.items():
+                blocks[f"uncert/{ch_id}/{model_id}/{utype}"] = _encode_tensor(ch)
 
     # Residual blocks: residual/{channel_id}/sign2nddiff
     for ch_id, res in ep.residuals.items():

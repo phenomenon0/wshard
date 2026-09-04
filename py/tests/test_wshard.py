@@ -268,23 +268,33 @@ class TestWShardAdapter:
         T = 16
         ep = Episode(id="filter", length=T)
         ep.observations["state"] = Channel(
-            name="state", dtype=DType.FLOAT32, shape=[4],
+            name="state",
+            dtype=DType.FLOAT32,
+            shape=[4],
             data=np.arange(T * 4, dtype=np.float32).reshape(T, 4),
         )
         ep.observations["pixels"] = Channel(
-            name="pixels", dtype=DType.FLOAT32, shape=[8],
+            name="pixels",
+            dtype=DType.FLOAT32,
+            shape=[8],
             data=np.zeros((T, 8), dtype=np.float32),
         )
         ep.actions["ctrl"] = Channel(
-            name="ctrl", dtype=DType.FLOAT32, shape=[2],
+            name="ctrl",
+            dtype=DType.FLOAT32,
+            shape=[2],
             data=np.ones((T, 2), dtype=np.float32),
         )
         ep.actions["aux"] = Channel(
-            name="aux", dtype=DType.FLOAT32, shape=[3],
+            name="aux",
+            dtype=DType.FLOAT32,
+            shape=[3],
             data=np.zeros((T, 3), dtype=np.float32),
         )
         ep.rewards = Channel(
-            name="reward", dtype=DType.FLOAT32, shape=[],
+            name="reward",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.arange(T, dtype=np.float32),
         )
 
@@ -651,19 +661,32 @@ class TestBitmaskIntegration:
 
         np.testing.assert_array_equal(unpacked, residuals)
 
-    def test_wshard_roundtrip_with_residual_encoding_field(self):
-        """Verify residual_encoding field in meta/wshard on roundtrip."""
+    def test_meta_wshard_does_not_depend_on_what_is_installed(self):
+        """meta/wshard is inside the seal, so nothing in it may vary by install.
+
+        It used to carry ``residual_encoding``, set from whether ``cowrie``
+        imported -- which made two identical episodes hash differently on two
+        machines. Both decode branches called the same unpack function anyway,
+        so the key described nothing about the bytes. Asserting its absence is
+        what stops it coming back.
+        """
         ep = Episode(id="bitmask-test", length=20)
         ep.observations["x"] = Channel(
-            name="x", dtype=DType.FLOAT32, shape=[],
+            name="x",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.sin(np.arange(20, dtype=np.float32) * 0.3),
         )
         ep.actions["a"] = Channel(
-            name="a", dtype=DType.FLOAT32, shape=[],
+            name="a",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.zeros(20, dtype=np.float32),
         )
         ep.terminations = Channel(
-            name="done", dtype=DType.BOOL, shape=[],
+            name="done",
+            dtype=DType.BOOL,
+            shape=[],
             data=np.array([False] * 19 + [True]),
         )
 
@@ -675,12 +698,20 @@ class TestBitmaskIntegration:
             loaded = load_wshard(path)
             assert loaded.length == 20
 
-            # Read raw meta/wshard to verify encoding field
             import json
-            with open(path, "rb") as f:
-                data = f.read()
-            # Find meta/wshard block
-            assert b'"residual_encoding"' in data
+
+            from wshard.wshard import _read_blocks
+
+            meta = json.loads(
+                _read_blocks(path.read_bytes(), None)["meta/wshard"].decode()
+            )
+            assert "residual_encoding" not in meta
+            assert meta == {
+                "format": "W-SHARD",
+                "version": "0.1",
+                "endianness": "little",
+                "residual_edges": "pad",
+            }
         finally:
             path.unlink()
 
@@ -708,12 +739,24 @@ class TestMultiModal:
 
         ep = Episode(id="mm-test", length=10)
 
-        rgb = Channel(name="rgb", dtype=DType.FLOAT32, shape=[3, 64, 64],
-                      data=np.random.randn(10, 3, 64, 64).astype(np.float32))
-        lang = Channel(name="language", dtype=DType.FLOAT32, shape=[768],
-                       data=np.random.randn(10, 768).astype(np.float32))
-        proprio = Channel(name="proprio", dtype=DType.FLOAT32, shape=[7],
-                          data=np.random.randn(10, 7).astype(np.float32))
+        rgb = Channel(
+            name="rgb",
+            dtype=DType.FLOAT32,
+            shape=[3, 64, 64],
+            data=np.random.randn(10, 3, 64, 64).astype(np.float32),
+        )
+        lang = Channel(
+            name="language",
+            dtype=DType.FLOAT32,
+            shape=[768],
+            data=np.random.randn(10, 768).astype(np.float32),
+        )
+        proprio = Channel(
+            name="proprio",
+            dtype=DType.FLOAT32,
+            shape=[7],
+            data=np.random.randn(10, 7).astype(np.float32),
+        )
 
         add_multimodal_observation(ep, "obs", Modality.RGB, rgb)
         add_multimodal_observation(ep, "obs", Modality.LANGUAGE, lang)
@@ -726,14 +769,26 @@ class TestMultiModal:
 
     def test_get_multimodal_observations(self):
         """Test filtering multi-modal observations."""
-        from wshard import Modality, add_multimodal_observation, get_multimodal_observations
+        from wshard import (
+            Modality,
+            add_multimodal_observation,
+            get_multimodal_observations,
+        )
 
         ep = Episode(id="mm-test", length=5)
 
-        rgb = Channel(name="rgb", dtype=DType.FLOAT32, shape=[3],
-                      data=np.random.randn(5, 3).astype(np.float32))
-        lang = Channel(name="lang", dtype=DType.FLOAT32, shape=[10],
-                       data=np.random.randn(5, 10).astype(np.float32))
+        rgb = Channel(
+            name="rgb",
+            dtype=DType.FLOAT32,
+            shape=[3],
+            data=np.random.randn(5, 3).astype(np.float32),
+        )
+        lang = Channel(
+            name="lang",
+            dtype=DType.FLOAT32,
+            shape=[10],
+            data=np.random.randn(5, 10).astype(np.float32),
+        )
 
         add_multimodal_observation(ep, "obs", Modality.RGB, rgb)
         add_multimodal_observation(ep, "goal", Modality.LANGUAGE, lang)
@@ -754,17 +809,27 @@ class TestMultiModal:
         ep = Episode(id="mm-roundtrip", length=5)
         ep.env_id = "VLAEnv-v0"
 
-        rgb = Channel(name="rgb", dtype=DType.FLOAT32, shape=[3],
-                      data=np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9],
-                                     [10, 11, 12], [13, 14, 15]], dtype=np.float32))
+        rgb = Channel(
+            name="rgb",
+            dtype=DType.FLOAT32,
+            shape=[3],
+            data=np.array(
+                [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15]],
+                dtype=np.float32,
+            ),
+        )
         add_multimodal_observation(ep, "obs", Modality.RGB, rgb)
 
         ep.actions["ctrl"] = Channel(
-            name="ctrl", dtype=DType.FLOAT32, shape=[2],
+            name="ctrl",
+            dtype=DType.FLOAT32,
+            shape=[2],
             data=np.random.randn(5, 2).astype(np.float32),
         )
         ep.terminations = Channel(
-            name="done", dtype=DType.BOOL, shape=[],
+            name="done",
+            dtype=DType.BOOL,
+            shape=[],
             data=np.array([False, False, False, False, True]),
         )
 
@@ -776,7 +841,8 @@ class TestMultiModal:
             assert "obs/rgb" in loaded.observations
             assert loaded.observations["obs/rgb"].modality == Modality.RGB
             np.testing.assert_array_almost_equal(
-                loaded.observations["obs/rgb"].data, rgb.data,
+                loaded.observations["obs/rgb"].data,
+                rgb.data,
             )
         finally:
             path.unlink()
@@ -797,11 +863,15 @@ class TestLatentActions:
         ep = Episode(id="latent-test", length=10)
 
         embeddings = Channel(
-            name="embeddings", dtype=DType.FLOAT32, shape=[16],
+            name="embeddings",
+            dtype=DType.FLOAT32,
+            shape=[16],
             data=np.random.randn(10, 16).astype(np.float32),
         )
         codebook = Channel(
-            name="codebook", dtype=DType.INT32, shape=[],
+            name="codebook",
+            dtype=DType.INT32,
+            shape=[],
             data=np.random.randint(0, 256, size=10, dtype=np.int32),
         )
 
@@ -823,7 +893,9 @@ class TestLatentActions:
         ep = Episode(id="latent-no-cb", length=5)
 
         embeddings = Channel(
-            name="embeddings", dtype=DType.FLOAT32, shape=[8],
+            name="embeddings",
+            dtype=DType.FLOAT32,
+            shape=[8],
             data=np.random.randn(5, 8).astype(np.float32),
         )
 
@@ -851,22 +923,30 @@ class TestLatentActions:
 
         ep = Episode(id="lanes-roundtrip", length=10)
         ep.observations["state"] = Channel(
-            name="state", dtype=DType.FLOAT32, shape=[4],
+            name="state",
+            dtype=DType.FLOAT32,
+            shape=[4],
             data=np.random.randn(10, 4).astype(np.float32),
         )
 
         pred = Channel(
-            name="pred", dtype=DType.FLOAT32, shape=[4],
+            name="pred",
+            dtype=DType.FLOAT32,
+            shape=[4],
             data=np.random.randn(10, 4).astype(np.float32),
         )
         codebook = Channel(
-            name="codebook", dtype=DType.INT32, shape=[],
+            name="codebook",
+            dtype=DType.INT32,
+            shape=[],
             data=np.random.randint(0, 256, size=10, dtype=np.int32),
         )
         ep.omens["state"] = {"dreamer_v3": pred}
         ep.omens["latent_action_codebook"] = {"genie3_v1": codebook}
         ep.residuals["state"] = Residual(
-            channel_id="state", type="sign2nddiff", data=b"\x0f\xf0\xaa",
+            channel_id="state",
+            type="sign2nddiff",
+            data=b"\x0f\xf0\xaa",
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -886,17 +966,113 @@ class TestLatentActions:
         assert res.type == "sign2nddiff"
         assert bytes(res.data) == b"\x0f\xf0\xaa"
 
+    def test_uncerts_disk_roundtrip(self):
+        """Uncerts must survive save -> load, typed, like omens do.
+
+        Go has had ``WShardEpisode.Uncerts`` and ``UncertBlockName`` since the
+        format shipped; Python had the string "uncert/" in one filter list and
+        no field at all. So a Go-written file loaded and re-saved in Python
+        lost its uncertainty blocks *and* the result passed verify_identity --
+        identity commits to the bytes present, and cannot notice a block that
+        was never decoded.
+        """
+        ep = Episode(id="uncert-roundtrip", length=8)
+        ep.observations["state"] = Channel(
+            name="state",
+            dtype=DType.FLOAT32,
+            shape=[3],
+            data=np.random.randn(8, 3).astype(np.float32),
+        )
+        var = Channel(
+            name="var",
+            dtype=DType.FLOAT32,
+            shape=[3],
+            data=np.abs(np.random.randn(8, 3)).astype(np.float32),
+        )
+        ent = Channel(
+            name="ent",
+            dtype=DType.FLOAT32,
+            shape=[],
+            data=np.abs(np.random.randn(8)).astype(np.float32),
+        )
+        # One model, two uncertainty kinds for the same channel: the reason the
+        # nesting is one level deeper than omens.
+        ep.uncerts["state"] = {"dyn_v1": {"variance": var, "entropy": ent}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "uncert.wshard")
+            save_wshard(ep, path)
+            ep2 = load_wshard(path)
+
+        got = ep2.uncerts["state"]["dyn_v1"]
+        assert sorted(got) == ["entropy", "variance"]
+        assert got["variance"].dtype == DType.FLOAT32
+        assert got["variance"].data.shape == (8, 3)
+        np.testing.assert_array_equal(got["variance"].data, var.data)
+        np.testing.assert_array_equal(got["entropy"].data, ent.data)
+
+    def test_channel_filter_keeps_prediction_lanes(self):
+        """``channels=[id]`` must return that channel's omen and uncert too.
+
+        The filter compared the whole post-lane remainder against the allowed
+        set, so "omen/state/dyn_v1" was tested as "state/dyn_v1" and never
+        matched. Signal and residual survived, predictions vanished -- the
+        quietest possible failure for a partial read whose entire purpose is
+        fetching prediction lanes without touching camera blocks.
+        """
+        ep = Episode(id="filter-lanes", length=6)
+        for cid in ("state", "other"):
+            ep.observations[cid] = Channel(
+                name=cid,
+                dtype=DType.FLOAT32,
+                shape=[2],
+                data=np.random.randn(6, 2).astype(np.float32),
+            )
+            ep.omens[cid] = {
+                "dyn_v1": Channel(
+                    name="p",
+                    dtype=DType.FLOAT32,
+                    shape=[2],
+                    data=np.random.randn(6, 2).astype(np.float32),
+                )
+            }
+            ep.uncerts[cid] = {
+                "dyn_v1": {
+                    "variance": Channel(
+                        name="v",
+                        dtype=DType.FLOAT32,
+                        shape=[2],
+                        data=np.ones((6, 2), dtype=np.float32),
+                    )
+                }
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "filtered.wshard")
+            save_wshard(ep, path)
+            got = load_wshard(path, channels=["state"])
+
+        assert list(got.omens) == ["state"], "omen lane lost or unfiltered"
+        assert list(got.uncerts) == ["state"], "uncert lane lost or unfiltered"
+        np.testing.assert_array_equal(
+            got.omens["state"]["dyn_v1"].data, ep.omens["state"]["dyn_v1"].data
+        )
+
     def test_unsupported_residual_type_fails_loud(self):
         """A residual type the format cannot store must raise, not vanish."""
         from wshard.types import Residual
 
         ep = Episode(id="bad-residual", length=5)
         ep.observations["state"] = Channel(
-            name="state", dtype=DType.FLOAT32, shape=[2],
+            name="state",
+            dtype=DType.FLOAT32,
+            shape=[2],
             data=np.zeros((5, 2), dtype=np.float32),
         )
         ep.residuals["state"] = Residual(
-            channel_id="state", type="delta_q", data=b"\x00",
+            channel_id="state",
+            type="delta_q",
+            data=b"\x00",
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -915,9 +1091,13 @@ class TestChunkedEpisodes:
 
     def test_chunk_fields_on_episode(self):
         """Test chunk fields on Episode dataclass."""
-        ep = Episode(id="chunk-test", length=100,
-                     chunk_index=0, total_chunks=5,
-                     timestep_range=[0, 99])
+        ep = Episode(
+            id="chunk-test",
+            length=100,
+            chunk_index=0,
+            total_chunks=5,
+            timestep_range=[0, 99],
+        )
         assert ep.is_chunked
         ep.validate()
 
@@ -926,7 +1106,9 @@ class TestChunkedEpisodes:
         ep = Episode(id="normal", length=50)
         assert not ep.is_chunked
         ep.observations["s"] = Channel(
-            name="s", dtype=DType.FLOAT32, shape=[],
+            name="s",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.zeros(50, dtype=np.float32),
         )
         ep.validate()
@@ -961,19 +1143,29 @@ class TestChunkedEpisodes:
 
     def test_chunked_wshard_roundtrip(self):
         """Test chunk fields survive save/load."""
-        ep = Episode(id="chunk-rt", length=20,
-                     chunk_index=2, total_chunks=10,
-                     timestep_range=[40, 59])
+        ep = Episode(
+            id="chunk-rt",
+            length=20,
+            chunk_index=2,
+            total_chunks=10,
+            timestep_range=[40, 59],
+        )
         ep.observations["s"] = Channel(
-            name="s", dtype=DType.FLOAT32, shape=[],
+            name="s",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.arange(20, dtype=np.float32),
         )
         ep.actions["a"] = Channel(
-            name="a", dtype=DType.FLOAT32, shape=[],
+            name="a",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.zeros(20, dtype=np.float32),
         )
         ep.terminations = Channel(
-            name="done", dtype=DType.BOOL, shape=[],
+            name="done",
+            dtype=DType.BOOL,
+            shape=[],
             data=np.array([False] * 19 + [True]),
         )
 
@@ -995,19 +1187,27 @@ class TestChunkedEpisodes:
         T = 100
         ep = Episode(id="big-ep", length=T, env_id="Test-v0")
         ep.observations["s"] = Channel(
-            name="s", dtype=DType.FLOAT32, shape=[],
+            name="s",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.arange(T, dtype=np.float32),
         )
         ep.actions["a"] = Channel(
-            name="a", dtype=DType.FLOAT32, shape=[],
+            name="a",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.zeros(T, dtype=np.float32),
         )
         ep.rewards = Channel(
-            name="reward", dtype=DType.FLOAT32, shape=[],
+            name="reward",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.ones(T, dtype=np.float32),
         )
         ep.terminations = Channel(
-            name="done", dtype=DType.BOOL, shape=[],
+            name="done",
+            dtype=DType.BOOL,
+            shape=[],
             data=np.array([False] * (T - 1) + [True]),
         )
 
@@ -1028,7 +1228,8 @@ class TestChunkedEpisodes:
                 all_obs.extend(chunk_ep.observations["s"].data.tolist())
 
             np.testing.assert_array_almost_equal(
-                all_obs, np.arange(T, dtype=np.float32),
+                all_obs,
+                np.arange(T, dtype=np.float32),
             )
 
     def test_write_chunk_incremental(self):
@@ -1048,7 +1249,9 @@ class TestChunkedEpisodes:
             for ci in range(3):
                 chunk = Episode(id="live-ep", length=10, env_id="Live-v0")
                 chunk.observations["s"] = Channel(
-                    name="s", dtype=DType.FLOAT32, shape=[],
+                    name="s",
+                    dtype=DType.FLOAT32,
+                    shape=[],
                     data=np.arange(ci * 10, ci * 10 + 10, dtype=np.float32),
                 )
                 writer.write_chunk(chunk)
@@ -1070,22 +1273,29 @@ class TestChunkedEpisodes:
             for chunk_ep in reader.iter_chunks():
                 all_obs.extend(chunk_ep.observations["s"].data.tolist())
             np.testing.assert_array_almost_equal(
-                all_obs, np.arange(30, dtype=np.float32),
+                all_obs,
+                np.arange(30, dtype=np.float32),
             )
 
     def test_single_chunk_backward_compat(self):
         """Test single-chunk episode is equivalent to unchunked."""
         ep = Episode(id="single", length=10, env_id="Env-v0")
         ep.observations["s"] = Channel(
-            name="s", dtype=DType.FLOAT32, shape=[],
+            name="s",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.arange(10, dtype=np.float32),
         )
         ep.actions["a"] = Channel(
-            name="a", dtype=DType.FLOAT32, shape=[],
+            name="a",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.zeros(10, dtype=np.float32),
         )
         ep.terminations = Channel(
-            name="done", dtype=DType.BOOL, shape=[],
+            name="done",
+            dtype=DType.BOOL,
+            shape=[],
             data=np.array([False] * 9 + [True]),
         )
 
@@ -1220,7 +1430,6 @@ class TestStreamingAppend:
         finally:
             path.unlink(missing_ok=True)
 
-
     def test_flush_interval_rejected(self):
         """The option fails loudly instead of being accepted and ignored.
 
@@ -1264,7 +1473,9 @@ class TestStreamingAppend:
             T = 135  # > 2x the 64-timestep interval that used to flush
 
             exp_a = np.stack([np.array([t, -t], dtype=np.float32) for t in range(T)])
-            exp_b = np.stack([np.array([1000 + t, 2000 + t], dtype=np.float32) for t in range(T)])
+            exp_b = np.stack(
+                [np.array([1000 + t, 2000 + t], dtype=np.float32) for t in range(T)]
+            )
             exp_r = np.arange(T, dtype=np.float32) * 0.5
 
             writer.begin_episode(env_id="MultiFlush-v0")
@@ -1305,7 +1516,9 @@ class TestStreamingAppend:
         try:
             channel_defs = [StreamChannelDef("state", DType.FLOAT32, [3])]
             writer = WShardStreamWriter(
-                path, "compressed-stream", channel_defs,
+                path,
+                "compressed-stream",
+                channel_defs,
                 compression=CompressionType.ZSTD,
             )
             T = 69  # > the 64-timestep interval that used to flush
@@ -1314,8 +1527,11 @@ class TestStreamingAppend:
             writer.begin_episode(env_id="CompressedStream-v0")
             for t in range(T):
                 writer.write_timestep(
-                    t=t, observations={"state": exp[t]}, actions={},
-                    reward=0.0, done=(t == T - 1),
+                    t=t,
+                    observations={"state": exp[t]},
+                    actions={},
+                    reward=0.0,
+                    done=(t == T - 1),
                 )
             writer.end_episode()
 
@@ -1351,15 +1567,21 @@ def _identity_episode(T=20):
     ep = Episode(id="identity-ep", length=T)
     ep.env_id = "identity-env"
     ep.observations["state"] = Channel(
-        name="state", dtype=DType.FLOAT32, shape=[4],
+        name="state",
+        dtype=DType.FLOAT32,
+        shape=[4],
         data=rng.standard_normal((T, 4)).astype(np.float32),
     )
     ep.actions["ctrl"] = Channel(
-        name="ctrl", dtype=DType.FLOAT32, shape=[2],
+        name="ctrl",
+        dtype=DType.FLOAT32,
+        shape=[2],
         data=rng.standard_normal((T, 2)).astype(np.float32),
     )
     ep.rewards = Channel(
-        name="reward", dtype=DType.FLOAT32, shape=[],
+        name="reward",
+        dtype=DType.FLOAT32,
+        shape=[],
         data=rng.standard_normal(T).astype(np.float32),
     )
     done = np.zeros(T, dtype=np.uint8)
@@ -1389,15 +1611,17 @@ class TestIdentity:
             ep = _identity_episode()
             ep.provenance = Provenance(
                 run_id="run-42",
-                source={"video_path": video.name,
-                        "video_sha256": hashlib.sha256(video.read_bytes()).hexdigest()},
+                source={
+                    "video_path": video.name,
+                    "video_sha256": hashlib.sha256(video.read_bytes()).hexdigest(),
+                },
             )
             p = tmp_path / name
             save_wshard(ep, p)
             return verify_identity(p)
 
         before = seal("a.wshard")
-        video.write_bytes(b"frame-B")   # one frame differs
+        video.write_bytes(b"frame-B")  # one frame differs
         after = seal("b.wshard")
         assert before != after, "editing the sidecar must move the episode identity"
 
@@ -1431,7 +1655,7 @@ class TestIdentity:
         other = _identity_episode(T=21)
         q = tmp_path / "other.wshard"
         save_wshard(other, q)
-        assert verify_identity(q) != sealed          # self-check still passes
+        assert verify_identity(q) != sealed  # self-check still passes
         with pytest.raises(ValueError, match="is not the one that identity names"):
             verify_identity(q, expected=sealed)
 
@@ -1463,12 +1687,14 @@ class TestIdentity:
         st_off = _struct.unpack("<Q", buf[16:24])[0]
         for i in range(entry_count):
             off = HEADER_SIZE + i * INDEX_ENTRY_SIZE
-            e = _parse_index_entry(bytes(buf[off:off + INDEX_ENTRY_SIZE]))
-            name = buf[st_off + e["name_offset"]: st_off + e["name_offset"] + e["name_len"]].decode()
+            e = _parse_index_entry(bytes(buf[off : off + INDEX_ENTRY_SIZE]))
+            name = buf[
+                st_off + e["name_offset"] : st_off + e["name_offset"] + e["name_len"]
+            ].decode()
             if name == "signal/state":
                 buf[e["data_offset"]] ^= 0xFF
-                block = bytes(buf[e["data_offset"]: e["data_offset"] + e["disk_size"]])
-                buf[off + 40: off + 44] = _struct.pack("<I", compute_crc32(block))
+                block = bytes(buf[e["data_offset"] : e["data_offset"] + e["disk_size"]])
+                buf[off + 40 : off + 44] = _struct.pack("<I", compute_crc32(block))
                 break
         else:
             pytest.fail("signal/state entry not found")
@@ -1533,8 +1759,9 @@ class TestStreamedIdentity:
         still seals -- it is just a different (unchained) episode."""
         prov = Provenance(run_id="run-a", epoch=1, first_seq=0, last_seq=7)
         a = _stream_to(tmp_path / "a.wshard", CompressionType.NONE, prov)
-        b = _stream_to(tmp_path / "b.wshard", CompressionType.NONE,
-                       _replace(prov, run_id="run-b"))
+        b = _stream_to(
+            tmp_path / "b.wshard", CompressionType.NONE, _replace(prov, run_id="run-b")
+        )
         bare = _stream_to(tmp_path / "bare.wshard", CompressionType.NONE, None)
         assert len({a, b, bare}) == 3
 
@@ -1543,15 +1770,25 @@ class TestChunkChain:
     def _episode(self, T=9):
         ep = Episode(id="chained", length=T, env_id="Test-v0")
         ep.observations["s"] = Channel(
-            name="s", dtype=DType.FLOAT32, shape=[],
+            name="s",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.arange(T, dtype=np.float32),
         )
         ep.actions["a"] = Channel(
-            name="a", dtype=DType.FLOAT32, shape=[],
+            name="a",
+            dtype=DType.FLOAT32,
+            shape=[],
             data=np.zeros(T, dtype=np.float32),
         )
-        ep.provenance = Provenance(run_id="run-x", epoch=2, first_seq=100, last_seq=108,
-                                   start_state="a" * 64, end_state="b" * 64)
+        ep.provenance = Provenance(
+            run_id="run-x",
+            epoch=2,
+            first_seq=100,
+            last_seq=108,
+            start_state="a" * 64,
+            end_state="b" * 64,
+        )
         return ep
 
     def test_chunks_link_to_their_predecessor(self, tmp_path):
@@ -1571,12 +1808,25 @@ class TestChunkChain:
             assert cur.prev_identity == prev["identity"]
 
         # Sequence numbers walk the run, and only the ends carry boundary state.
-        assert [(p.first_seq, p.last_seq) for p in provs] == [(100, 103), (104, 107), (108, 108)]
+        assert [(p.first_seq, p.last_seq) for p in provs] == [
+            (100, 103),
+            (104, 107),
+            (108, 108),
+        ]
         assert provs[0].start_state == "a" * 64 and provs[0].end_state == ""
         assert provs[-1].end_state == "b" * 64 and provs[-1].start_state == ""
 
         validate_chunk_chain(writer.manifest, str(tmp_path))
-        assert len(list(ChunkedEpisodeReader(str(tmp_path / "chained_manifest.wshard")).iter_chunks())) == 3
+        assert (
+            len(
+                list(
+                    ChunkedEpisodeReader(
+                        str(tmp_path / "chained_manifest.wshard")
+                    ).iter_chunks()
+                )
+            )
+            == 3
+        )
 
     def test_swapped_chunk_breaks_the_chain(self, tmp_path):
         """A chunk from another run has a valid identity and passes its own
@@ -1592,7 +1842,9 @@ class TestChunkChain:
         other_writer.write_episode_chunked(ep)
 
         target = tmp_path / writer.manifest.chunks[1]["uri"]
-        target.write_bytes((other / other_writer.manifest.chunks[1]["uri"]).read_bytes())
+        target.write_bytes(
+            (other / other_writer.manifest.chunks[1]["uri"]).read_bytes()
+        )
         verify_identity(target)  # intact in itself
 
         with pytest.raises(ValueError, match="chunk 1 links to"):

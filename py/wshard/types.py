@@ -268,6 +268,12 @@ class Episode:
     # Key structure: channel_id -> model_id -> Channel
     omens: Dict[str, Dict[str, Channel]] = field(default_factory=dict)
 
+    # Predictive uncertainty for an omen, one level deeper than omens because
+    # the block name is uncert/{channel_id}/{model_id}/{uncert_type}: one model
+    # can publish several kinds (variance, entropy, ...) for the same channel.
+    # Key structure: channel_id -> model_id -> uncert_type -> Channel
+    uncerts: Dict[str, Dict[str, Dict[str, Channel]]] = field(default_factory=dict)
+
     # W-SHARD specific: residual encodings
     residuals: Dict[str, Residual] = field(default_factory=dict)
 
@@ -406,6 +412,14 @@ class Episode:
             ep.omens[ch_id] = {}
             for model_id, ch in models.items():
                 ep.omens[ch_id][model_id] = ch.clone()
+
+        # Clone uncerts
+        for ch_id, models in self.uncerts.items():
+            ep.uncerts[ch_id] = {}
+            for model_id, types in models.items():
+                ep.uncerts[ch_id][model_id] = {
+                    t: ch.clone() for t, ch in types.items()
+                }
 
         # Clone residuals (shallow - data is bytes)
         for k, v in self.residuals.items():

@@ -45,9 +45,12 @@ from .wshard import (
     DEFAULT_ALIGNMENT,
     IDENTITY_BLOCK,
     PROVENANCE_BLOCK,
+    WSHARD_VERSION,
     compute_crc32,
     _identity_block_from_leaves,
+    _meta_block,
     _provenance_block,
+    _timebase_meta,
 )
 from .compress import (
     CompressionType,
@@ -506,48 +509,55 @@ class WShardStreamWriter:
         """Build metadata blocks for finalization."""
         blocks = {}
 
-        # meta/wshard
+        # meta/wshard -- byte-for-byte what save_wshard writes. This block is in
+        # the leaf map, so a "streaming": True here means a streamed episode and
+        # a batch-written one of identical content get different identities,
+        # which is exactly what this writer's end_episode claims not to do.
         meta_wshard = {
             "format": "W-SHARD",
-            "wshard_version": "0.1",
+            "version": WSHARD_VERSION,
             "endianness": "little",
-            "alignment": 32,
-            "streaming": True,
+            "residual_edges": "pad",
         }
-        blocks["meta/wshard"] = json.dumps(meta_wshard).encode("utf-8")
+        blocks["meta/wshard"] = _meta_block(meta_wshard)
 
         # meta/episode
-        dt_ns = (
-            int(1e9 / self._timebase.tick_hz)
-            if self._timebase.tick_hz > 0
-            else 33333333
-        )
         meta_episode = {
             "episode_id": self.episode_id,
             "env_id": self._env_id,
             "length_T": self._timestep_count,
-            "timebase": {
-                "type": self._timebase.type.value,
-                "dt_ns": dt_ns,
-            },
+            "timebase": _timebase_meta(self._timebase),
         }
-        blocks["meta/episode"] = json.dumps(meta_episode).encode("utf-8")
+        blocks["meta/episode"] = _meta_block(meta_episode)
 
-        # meta/channels
-        channels_list = []
-        for name, ch_def in self.channel_defs.items():
-            ch_entry: Dict[str, Any] = {
+        # meta/channels. One entry per channel block actually on disk, in the
+        # order save_wshard emits them: every signal then every action, each
+        # sorted by channel id -- see FORMAT.md §9 on why that order is not the
+        # caller's insertion order. The
+        # action entries used to be left out, and since the entry is what
+        # carries a channel's shape, the action came back flat and load ->
+        # save on a streamed file raised "length mismatch". _block_positions
+        # was filled by the flush that ran just before this and skips empty
+        # buffers, so it is the record of which blocks exist.
+        def _entry(name: str, prefix: str) -> Dict[str, Any]:
+            ch_def = self.channel_defs[name]
+            entry: Dict[str, Any] = {
                 "id": name,
                 "dtype": ch_def.dtype.value,
                 "shape": ch_def.shape,
-                "signal_block": f"signal/{name}",
+                "signal_block": f"{prefix}/{name}",
             }
             if ch_def.modality is not None:
-                ch_entry["modality"] = ch_def.modality.value
-            channels_list.append(ch_entry)
-        blocks["meta/channels"] = json.dumps({"channels": channels_list}).encode(
-            "utf-8"
-        )
+                entry["modality"] = ch_def.modality.value
+            return entry
+
+        channels_list = [
+            _entry(name, prefix)
+            for prefix in ("signal", "action")
+            for name in sorted(self.channel_defs)
+            if f"{prefix}/{name}" in self._block_positions
+        ]
+        blocks["meta/channels"] = _meta_block({"channels": channels_list})
 
         return blocks
 

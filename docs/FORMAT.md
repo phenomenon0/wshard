@@ -168,10 +168,35 @@ Data blocks start at boundaries determined by the `alignment` field in the heade
 
 ## 9. Identity and provenance
 
-Two `meta/` blocks are not ordinary metadata — their bytes are hashed, so they
-have to be **canonical JSON** (glyph SPEC-CANON §1-§4: keys sorted by UTF-8
-bytes, no insignificant whitespace, RFC 8785 string escaping) and not merely
-valid JSON.
+Every `meta/` block is hashed, so every one of them has to be **canonical JSON**
+(glyph SPEC-CANON §1-§4: keys sorted by UTF-8 bytes, no insignificant
+whitespace, RFC 8785 string escaping) and not merely valid JSON. This applies to
+`meta/wshard`, `meta/episode`, `meta/channels`, `meta/provenance` and
+`meta/identity` alike. A writer that emits `{"a": 1, "b": 2}` where another
+emits `{"a":1,"b":2}` seals a different identity for the same episode, which
+makes the identity a fingerprint of the writer rather than of the content.
+
+Three further rules exist for the same reason — an identity that is not
+reproducible by an independent implementation is worth nothing:
+
+- **`meta/wshard` is a constant.** Exactly `{"endianness":"little",
+  "format":"W-SHARD","residual_edges":"pad","version":"0.1"}`, the same bytes in
+  every file. Nothing about the writer (its language, its version, whether it
+  streamed) and nothing about the container (alignment, compression, index
+  layout) goes in here. Alignment in particular lives in the header, and putting
+  a copy inside the seal would contradict §8 by making the identity
+  alignment-dependent.
+- **`meta/channels` is sorted**, by channel id within each group, groups in the
+  order signal, action, omen, uncert. Dict or map iteration order records how
+  the caller assembled the episode, not what is in it.
+- **`meta/channels` declares dtype and shape for every block that has them**,
+  `omen/` and `uncert/` included — those blocks are bare tensor bytes and carry
+  no header of their own. A reader that has to guess `u8` will seal its guess.
+
+Optional keys are the remaining hazard: an absent key and a key holding a
+default are different canonical JSON. `meta/episode` omits `timestep_range`
+rather than writing `[0,0]`, and `meta/channels` omits `modality`,
+`sampling_rate_hz` and `content_type` rather than writing empty ones.
 
 `meta/identity` is written **last**, after every other block:
 
@@ -182,7 +207,11 @@ valid JSON.
 
 The file's identity is `sha256` of that block, 64 lowercase hex. Leaves are over
 *uncompressed* bytes, so the same episode written none / zstd / lz4 gives three
-different files, three different sets of CRC32Cs, and one identity.
+different files, three different sets of CRC32Cs, and one identity. The same
+holds across writers and across languages: one logical episode has one identity
+whether Python or Go wrote it, in one pass or a timestep at a time. That is the
+property the rest of this section exists to make true, and
+`py/tests/test_identity_parity.py` is where it is asserted.
 
 `meta/provenance` is optional and, when present, is written immediately **before**
 `meta/identity`, so the identity commits to it:
@@ -213,6 +242,18 @@ every block matches what the writer sealed.
 
 The third row is the one that detects an edit; the second only detects bit rot,
 because whoever rewrote a block also resealed `meta/identity`.
+
+Neither row says anything about whether the episode is *correct*. An identity
+proves the bytes are the bytes the writer sealed; a corpus of files that all
+hold the wrong frames verifies 100% clean. That is the intended behaviour and
+worth stating, because it is easy to read the other way.
+
+**Known gaps.** The TypeScript writers do not seal at all — the `—` cells above
+are literal. `meta/channels`'s `sampling_rate_hz` and `content_type` have no
+field on Go's `WShardChannel`, so a Python-written file carrying either loses it
+if Go reads and rewrites it, and the two writers disagree on that episode's
+identity. Both are feature gaps, not spec ambiguities: the rules above say what
+the bytes must be.
 
 ---
 

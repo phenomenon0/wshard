@@ -110,6 +110,35 @@ func MultiModalSignalBlockName(group string, mod Modality) string {
 	return JoinPath("signal", JoinPath(group, string(mod)))
 }
 
+// canonicalJSON marshals a metadata block the way glyph's canon_json does:
+// keys sorted, no spaces. Every block meta/identity commits to has to be
+// byte-identical across writers and languages, or two implementations compute
+// two identities for one episode.
+//
+// json.Marshal already does this for a map, but emits a struct's fields in
+// declaration order, so the structs below go out through a map. The round trip
+// also renders integers exactly, up to the 2^53 the format caps them at anyway
+// (see FORMAT.md on meta/provenance).
+//
+// ponytail: Go and glyph diverge on extreme floats (1e20, 1e-7) and no
+// metadata field carries one. TestIdentityParity catches it if that changes.
+func canonicalJSON(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	return json.Marshal(doc)
+}
+
+// WShardMetaVersion is meta/wshard's "version". It names the metadata schema,
+// not the binary container revision in the header, and must match the Python
+// writer's WSHARD_VERSION: the block is inside the seal.
+const WShardMetaVersion = "0.1"
+
 // ============================================================
 // Internal JSON structs for meta serialization
 // ============================================================
@@ -135,8 +164,11 @@ type wshardEpisodeMeta struct {
 	Timebase      *wshardTimebaseJ `json:"timebase,omitempty"`
 	ChunkIndex    *int             `json:"chunk_index,omitempty"`
 	TotalChunks   *int             `json:"total_chunks,omitempty"`
-	TimestepRange [2]int           `json:"timestep_range,omitempty"`
-	Metadata      map[string]any   `json:"metadata,omitempty"`
+	// Pointer, not [2]int: `omitempty` is a no-op on a Go array, so a value type
+	// would always emit `"timestep_range":[0,0]` and diverge from writers that omit
+	// the key. [0,0] means "unset" here, as it already does in wshard_chunked.go.
+	TimestepRange *[2]int        `json:"timestep_range,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
 
 type wshardChannelDef struct {
@@ -207,12 +239,17 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 		return w.WriteEntryTyped(name, data, contentType)
 	}
 
-	// meta/wshard
-	metaJSON, err := json.Marshal(map[string]any{
+	// meta/wshard. Keys agreed with the Python writer: this block is in the
+	// leaf map, so any key one writer emits and the other does not gives two
+	// identities for one episode. "timebase" is gone from here because
+	// meta/episode always carries it and both writers read it from there;
+	// resolvedEpisodeTimebase keeps the fallback for files written before this.
+	//
+	metaJSON, err := canonicalJSON(map[string]any{
+		"endianness":     "little",
 		"format":         "W-SHARD",
-		"version":        "0.1",
 		"residual_edges": "pad",
-		"timebase":       episodeTimebaseMeta(ep.Timebase),
+		"version":        WShardMetaVersion,
 	})
 	if err != nil {
 		cleanup()
@@ -225,14 +262,18 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 
 	// meta/episode
 	lengthT := ep.LengthT
-	epJSON, err := json.Marshal(wshardEpisodeMeta{
+	var tsRange *[2]int
+	if ep.TimestepRange != [2]int{0, 0} {
+		tsRange = &ep.TimestepRange
+	}
+	epJSON, err := canonicalJSON(wshardEpisodeMeta{
 		EpisodeID:     ep.ID,
 		EnvID:         ep.EnvID,
 		LengthT:       &lengthT,
 		Timebase:      episodeTimebaseMeta(ep.Timebase),
 		ChunkIndex:    ep.ChunkIndex,
 		TotalChunks:   ep.TotalChunks,
-		TimestepRange: ep.TimestepRange,
+		TimestepRange: tsRange,
 		Metadata:      ep.Metadata,
 	})
 	if err != nil {
@@ -268,7 +309,35 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 			SignalBlock: JoinPath("action", name),
 		})
 	}
-	chanJSON, err := json.Marshal(channelsMeta)
+	// omen/ and uncert/ blocks are bare tensor bytes; meta/channels is where
+	// their dtype and shape are declared, same as every other channel. Sorted by
+	// block name so a Go map's iteration order never reaches the seal.
+	omenBlocks := map[string]*WShardChannel{}
+	for chID, models := range ep.Omens {
+		for modelID, ch := range models {
+			omenBlocks[OmenBlockName(chID, modelID)] = ch
+		}
+	}
+	for _, block := range sortedChannelNames(omenBlocks) {
+		ch := omenBlocks[block]
+		channelsMeta.Channels = append(channelsMeta.Channels, wshardChannelDef{
+			ID:          block,
+			DType:       canonicalDType(ch.DType),
+			Shape:       ch.Shape,
+			SignalBlock: block,
+		})
+	}
+	for _, block := range sortedChannelNames(ep.Uncerts) {
+		ch := ep.Uncerts[block]
+		channelsMeta.Channels = append(channelsMeta.Channels, wshardChannelDef{
+			ID:          block,
+			DType:       canonicalDType(ch.DType),
+			Shape:       ch.Shape,
+			SignalBlock: block,
+		})
+	}
+
+	chanJSON, err := canonicalJSON(channelsMeta)
 	if err != nil {
 		cleanup()
 		return fmt.Errorf("wshard: marshal meta/channels: %w", err)
@@ -316,6 +385,18 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 	if err := put("done", doneBuf, ContentTypeUnknown); err != nil {
 		cleanup()
 		return fmt.Errorf("wshard: write done: %w", err)
+	}
+
+	// time/ticks. FORMAT.md lists it and the Python writer emits it; a block
+	// present in one writer's output and absent from the other's is a
+	// difference in the leaf map, so the two never agree on an identity.
+	ticksBuf := make([]byte, ep.LengthT*4)
+	for i := 0; i < ep.LengthT; i++ {
+		binary.LittleEndian.PutUint32(ticksBuf[i*4:], uint32(int32(i)))
+	}
+	if err := put("time/ticks", ticksBuf, ContentTypeUnknown); err != nil {
+		cleanup()
+		return fmt.Errorf("wshard: write time/ticks: %w", err)
 	}
 
 	// omen blocks
@@ -425,12 +506,21 @@ func OpenWShard(path string) (*WShardEpisode, error) {
 	actions := make(map[string]*WShardChannel)
 	parsedEntries := make(map[string]struct{})
 
+	// meta/channels also declares dtype/shape for omen/ and uncert/ blocks, whose
+	// bytes carry neither. Those rows are held back from readWShardChannel --
+	// they are not observations -- and applied when the blocks are read below.
+	chanDefs := make(map[string]wshardChannelDef)
+
 	var channelsMeta wshardChannelsMeta
 	if err := json.Unmarshal(chanRaw, &channelsMeta); err == nil && len(channelsMeta.Channels) > 0 {
 		for _, def := range channelsMeta.Channels {
 			fullName := def.SignalBlock
 			if fullName == "" {
 				fullName = JoinPath("signal", def.ID)
+			}
+			chanDefs[fullName] = def
+			if strings.HasPrefix(fullName, "omen/") || strings.HasPrefix(fullName, "uncert/") {
+				continue
 			}
 			if err := readWShardChannel(r, fullName, def, observations, actions); err != nil {
 				return nil, err
@@ -495,8 +585,10 @@ func OpenWShard(path string) (*WShardEpisode, error) {
 			omens[chID] = make(map[string]*WShardChannel)
 		}
 		omens[chID][modelID] = &WShardChannel{
-			Name: fullName,
-			Data: data,
+			Name:  fullName,
+			DType: declaredDType(chanDefs, fullName),
+			Shape: chanDefs[fullName].Shape,
+			Data:  data,
 		}
 	}
 
@@ -508,8 +600,10 @@ func OpenWShard(path string) (*WShardEpisode, error) {
 			return nil, fmt.Errorf("wshard: read %s: %w", fullName, err)
 		}
 		uncerts[fullName] = &WShardChannel{
-			Name: fullName,
-			Data: data,
+			Name:  fullName,
+			DType: declaredDType(chanDefs, fullName),
+			Shape: chanDefs[fullName].Shape,
+			Data:  data,
 		}
 	}
 
@@ -553,6 +647,11 @@ func OpenWShard(path string) (*WShardEpisode, error) {
 		terminations[i] = b != 0
 	}
 
+	var readTsRange [2]int
+	if epMeta.TimestepRange != nil {
+		readTsRange = *epMeta.TimestepRange
+	}
+
 	return &WShardEpisode{
 		ID:            epMeta.resolvedID(),
 		EnvID:         epMeta.EnvID,
@@ -567,7 +666,7 @@ func OpenWShard(path string) (*WShardEpisode, error) {
 		Residuals:     residuals,
 		ChunkIndex:    epMeta.ChunkIndex,
 		TotalChunks:   epMeta.TotalChunks,
-		TimestepRange: epMeta.TimestepRange,
+		TimestepRange: readTsRange,
 		Metadata:      epMeta.Metadata,
 		Provenance:    provenance,
 	}, nil
@@ -648,6 +747,16 @@ func pathRemainder(name string) string {
 		return name
 	}
 	return remainder
+}
+
+// declaredDType is the dtype meta/channels gives a block, defaulting to u8 --
+// raw bytes, which is what a block with no declaration is. The Python reader
+// falls back the same way, and the fallback is written back into the seal.
+func declaredDType(defs map[string]wshardChannelDef, block string) string {
+	if dt := defs[block].DType; dt != "" {
+		return dt
+	}
+	return "u8"
 }
 
 func sortedChannelNames(channels map[string]*WShardChannel) []string {
