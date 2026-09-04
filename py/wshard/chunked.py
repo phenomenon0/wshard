@@ -3,19 +3,37 @@ Chunked episode support for W-SHARD (Gap 1).
 
 Enables episodes spanning multiple shard files for Cosmos-scale datasets.
 Each chunk is a normal wshard file. A manifest shard (role=0x04) indexes
-all chunks with URIs, SHA-256 hashes, and timestep ranges.
+all chunks with URIs, SHA-256 hashes, identities, and timestep ranges.
+
+Chunks written from one episode form a chain: each carries the identity of
+the one before it in its own meta/provenance, so a missing or swapped chunk
+is detectable without trusting the manifest that lists them. See
+validate_chunk_chain.
 """
 
 import hashlib
 import json
 import struct
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterator, List, Optional, Dict, Any
 
 import numpy as np
+from glyph import canon_json, from_json_loose
 
 from .types import Episode, Channel, DType
-from .wshard import save_wshard, load_wshard, MAGIC, VERSION, HEADER_SIZE, INDEX_ENTRY_SIZE, DEFAULT_ALIGNMENT
+from .wshard import (
+    save_wshard,
+    load_wshard,
+    episode_identity,
+    episode_provenance,
+    verify_identity,
+    MAGIC,
+    VERSION,
+    HEADER_SIZE,
+    INDEX_ENTRY_SIZE,
+    DEFAULT_ALIGNMENT,
+)
 from .compress import CompressionType, CompressionLevel
 
 # Manifest shard role
@@ -38,19 +56,34 @@ class ChunkManifest:
         sha256: str,
         timestep_range: List[int],
         length_t: int,
+        identity: str = "",
     ) -> None:
-        """Add a chunk entry to the manifest."""
-        self.chunks.append({
-            "chunk_index": chunk_index,
-            "uri": uri,
-            "sha256": sha256,
-            "timestep_range": timestep_range,
-            "length_T": length_t,
-        })
+        """Add a chunk entry to the manifest.
+
+        ``sha256`` is over the chunk file's bytes, so recompressing a chunk
+        breaks it. ``identity`` is the chunk's ``episode_identity``, over its
+        block contents, which survives that; readers prefer it when present.
+        """
+        self.chunks.append(
+            {
+                "chunk_index": chunk_index,
+                "uri": uri,
+                "sha256": sha256,
+                "identity": identity,
+                "timestep_range": timestep_range,
+                "length_T": length_t,
+            }
+        )
         self.total_timesteps += length_t
 
     def to_json(self) -> bytes:
-        """Serialize manifest to JSON bytes."""
+        """Serialize the manifest as glyph canonical JSON.
+
+        Canonical rather than pretty-printed: the manifest is the root of the
+        chunk chain, so sha256 of these bytes is its fingerprint, and that only
+        means anything if two producers of the same manifest emit the same
+        bytes. Key order and number rendering are the canon's, not dict order.
+        """
         manifest = {
             "episode_id": self.episode_id,
             "env_id": self.env_id,
@@ -58,7 +91,7 @@ class ChunkManifest:
             "total_timesteps": self.total_timesteps,
             "chunks": self.chunks,
         }
-        return json.dumps(manifest, indent=2).encode("utf-8")
+        return canon_json(from_json_loose(manifest)).encode("utf-8")
 
     @classmethod
     def from_json(cls, data: bytes) -> "ChunkManifest":
@@ -100,13 +133,19 @@ class ChunkedEpisodeWriter:
         self.compression_level = compression_level
         self.manifest = ChunkManifest(episode_id, env_id)
         self._chunk_count = 0
+        # Identity of the last chunk written, which the next one links back to.
+        # Follows write order, not chunk_index: a caller writing chunks out of
+        # order gets a chain in the order it wrote them.
+        self._prev_identity = ""
 
         self.base_path.mkdir(parents=True, exist_ok=True)
 
     def _chunk_filename(self, chunk_index: int) -> str:
         return f"{self.episode_id}_chunk_{chunk_index:04d}.wshard"
 
-    def write_chunk(self, episode_slice: Episode, chunk_index: Optional[int] = None) -> Path:
+    def write_chunk(
+        self, episode_slice: Episode, chunk_index: Optional[int] = None
+    ) -> Path:
         """
         Write one chunk file.
 
@@ -123,6 +162,15 @@ class ChunkedEpisodeWriter:
         # Set chunk metadata on the episode
         episode_slice.chunk_index = chunk_index
 
+        # Link this chunk to the previous one before writing: prev_identity is
+        # inside meta/provenance, which meta/identity commits to, so it has to
+        # be right at save time -- it cannot be patched in afterwards without
+        # invalidating the chunk's own identity. Only filled when the caller
+        # supplied provenance and left prev_identity empty.
+        prov = episode_slice.provenance
+        if prov is not None and not prov.prev_identity and self._prev_identity:
+            episode_slice.provenance = replace(prov, prev_identity=self._prev_identity)
+
         filename = self._chunk_filename(chunk_index)
         chunk_path = self.base_path / filename
 
@@ -131,6 +179,9 @@ class ChunkedEpisodeWriter:
         # Compute SHA-256
         with open(chunk_path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
+
+        identity = episode_identity(chunk_path)
+        self._prev_identity = identity
 
         # Compute timestep range
         global_start = chunk_index * self.chunk_size_t
@@ -144,6 +195,7 @@ class ChunkedEpisodeWriter:
             sha256=sha256,
             timestep_range=timestep_range,
             length_t=episode_slice.length,
+            identity=identity,
         )
 
         self._chunk_count = max(self._chunk_count, chunk_index + 1)
@@ -177,6 +229,23 @@ class ChunkedEpisodeWriter:
                 total_chunks=total_chunks,
                 timestep_range=[start_t, end_t - 1],
             )
+
+            if episode.provenance is not None:
+                base = episode.provenance
+                chunk_ep.provenance = replace(
+                    base,
+                    first_seq=base.first_seq + start_t,
+                    last_seq=base.first_seq + end_t - 1,
+                    # Only the first chunk starts where the episode started, and
+                    # only the last one ends where it ended. The states either
+                    # side of an interior cut are not known here, and "" is the
+                    # encoding for "unknown" -- better than repeating a
+                    # fingerprint that describes a different point in the run.
+                    start_state=base.start_state if ci == 0 else "",
+                    end_state=base.end_state if ci == total_chunks - 1 else "",
+                    # Filled by write_chunk with the previous chunk's identity.
+                    prev_identity="",
+                )
 
             # Slice observations
             for name, ch in episode.observations.items():
@@ -280,11 +349,11 @@ class ChunkedEpisodeReader:
             raise ValueError("Manifest has no entries")
 
         entry_offset = HEADER_SIZE
-        entry_data = data[entry_offset:entry_offset + INDEX_ENTRY_SIZE]
+        entry_data = data[entry_offset : entry_offset + INDEX_ENTRY_SIZE]
         block_offset = struct.unpack("<Q", entry_data[16:24])[0]
         block_size = struct.unpack("<Q", entry_data[24:32])[0]
 
-        manifest_json = data[block_offset:block_offset + block_size]
+        manifest_json = data[block_offset : block_offset + block_size]
         self.manifest = ChunkManifest.from_json(manifest_json)
         return self.manifest
 
@@ -298,9 +367,20 @@ class ChunkedEpisodeReader:
             chunk_path = self.base_dir / uri
             ep = load_wshard(chunk_path)
 
-            # Verify SHA-256 if present
+            # Prefer identity over the file hash: it proves every block matches
+            # what the chunk committed to, and unlike sha256-of-bytes it
+            # survives the chunk being rewritten with different compression or
+            # alignment. Only one of the two runs -- both walk the whole file.
+            expected_identity = chunk_info.get("identity")
             expected_sha = chunk_info.get("sha256")
-            if expected_sha:
+            if expected_identity:
+                actual_identity = verify_identity(chunk_path)
+                if actual_identity != expected_identity:
+                    raise ValueError(
+                        f"identity mismatch for chunk {chunk_info['chunk_index']}: "
+                        f"expected {expected_identity}, got {actual_identity}"
+                    )
+            elif expected_sha:
                 actual_sha = hashlib.sha256(chunk_path.read_bytes()).hexdigest()
                 if actual_sha != expected_sha:
                     raise ValueError(
@@ -382,6 +462,35 @@ def validate_chunk_continuity(manifest: ChunkManifest) -> None:
         )
 
 
+def validate_chunk_chain(manifest: ChunkManifest, base_dir: str) -> None:
+    """
+    Validate that each chunk links back to the one before it.
+
+    The link lives in each chunk's ``meta/provenance``, not in the manifest, so
+    this reads the chunk files. ``episode_provenance`` decodes no tensors, but
+    it still reads every chunk's bytes -- this is a verification pass, not
+    something to call per training step.
+
+    Chunks written without provenance are skipped: unchained is a valid state,
+    and a manifest of chunks that never claimed to form a chain is not broken.
+
+    Raises:
+        ValueError: naming the first chunk whose ``prev_identity`` does not
+            match the identity of the preceding chunk.
+    """
+    prev_identity = ""
+    for entry in sorted(manifest.chunks, key=lambda c: c["chunk_index"]):
+        chunk_path = Path(base_dir) / entry["uri"]
+        prov = episode_provenance(chunk_path)
+        if prov is not None and prev_identity and prov.prev_identity != prev_identity:
+            raise ValueError(
+                f"chunk {entry['chunk_index']} links to "
+                f"{prov.prev_identity or '<nothing>'}, but the chunk before it "
+                f"is {prev_identity}"
+            )
+        prev_identity = entry.get("identity") or episode_identity(chunk_path)
+
+
 def _write_manifest_shard(path: Path, manifest_json: bytes) -> None:
     """Write a minimal shard v2 file with role=0x04 containing manifest JSON."""
     import crc32c
@@ -395,7 +504,9 @@ def _write_manifest_shard(path: Path, manifest_json: bytes) -> None:
     string_table_offset = HEADER_SIZE + index_size
     data_section_offset = string_table_offset + name_len
     # Align data section
-    padding = (DEFAULT_ALIGNMENT - (data_section_offset % DEFAULT_ALIGNMENT)) % DEFAULT_ALIGNMENT
+    padding = (
+        DEFAULT_ALIGNMENT - (data_section_offset % DEFAULT_ALIGNMENT)
+    ) % DEFAULT_ALIGNMENT
     data_section_offset += padding
     total_size = data_section_offset + len(manifest_json)
 

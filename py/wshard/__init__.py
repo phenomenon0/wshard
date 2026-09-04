@@ -25,6 +25,7 @@ from .types import (
     DType,
     Channel,
     Episode,
+    Provenance,
     Residual,
     TimebaseSpec,
     TimebaseType,
@@ -64,6 +65,7 @@ from .wshard import (
     load_wshard,
     save_wshard,
     episode_identity,
+    episode_provenance,
     verify_identity,
     # Gap 5: VLA Multi-Modal
     add_multimodal_observation,
@@ -105,6 +107,7 @@ __all__ = [
     "Channel",
     "Episode",
     "Residual",
+    "Provenance",
     "TimebaseSpec",
     "TimebaseType",
     "Modality",
@@ -155,6 +158,7 @@ __all__ = [
     "load_wshard",
     "save_wshard",
     "episode_identity",
+    "episode_provenance",
     "verify_identity",
     # HuggingFace Hub (optional)
     "HuggingFaceAdapter",

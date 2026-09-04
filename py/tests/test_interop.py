@@ -21,9 +21,17 @@ import xxhash
 from wshard.wshard import (
     compute_crc32,
     _parse_tensor_block,
+    _read_all,
+    _read_blocks,
     load_wshard,
     save_wshard,
+    episode_identity,
+    episode_provenance,
+    verify_identity,
     decode_residuals,
+    PROVENANCE_BLOCK,
+    IDENTITY_BLOCK,
+    _identity_block,
     MAGIC,
     VERSION,
     ROLE_WSHARD,
@@ -31,7 +39,7 @@ from wshard.wshard import (
     INDEX_ENTRY_SIZE,
     DEFAULT_ALIGNMENT,
 )
-from wshard.types import DType, Episode, Channel, Modality
+from wshard.types import DType, Episode, Channel, Modality, Provenance
 from wshard.compress import (
     CompressionType,
     decompress,
@@ -889,3 +897,744 @@ def test_golden_identity_parity():
         pytest.skip("golden_hashes.json has no identity_simple_episode (regenerate with Go)")
     from wshard import verify_identity
     assert verify_identity(_GOLDEN_DIR / "simple_episode.wshard") == hashes["identity_simple_episode"]
+
+
+def test_go_reads_python_streamed_file(tmp_path):
+    """Go must be able to open a Python-streamed file, and read the right values.
+
+    Go rejects an index whose block offsets are not monotonic. The Python
+    streaming writer used to flush on an interval, appending every block on
+    each flush while keeping one growing extent per block, which produced
+    exactly that -- so Go could not open a Python-streamed file at all, and
+    Python read it back as a silently reshuffled episode.
+    """
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
+
+    py_path = tmp_path / "python_streamed.wshard"
+    channel_defs = [
+        ChannelDef("a", DType.FLOAT32, [2]),
+        ChannelDef("b", DType.FLOAT32, [2]),
+    ]
+    writer = WShardStreamWriter(py_path, "py-streamed", channel_defs)
+    T = 131  # > 2x the 64-timestep interval that used to flush
+
+    exp_a = np.stack([np.array([t, -t], dtype=np.float32) for t in range(T)])
+    exp_b = np.stack([np.array([1000 + t, 2000 + t], dtype=np.float32) for t in range(T)])
+
+    writer.begin_episode(env_id="PyStream-v0")
+    for t in range(T):
+        writer.write_timestep(
+            t=t,
+            observations={"a": exp_a[t], "b": exp_b[t]},
+            actions={},
+            reward=float(t),
+            done=(t == T - 1),
+        )
+    writer.end_episode()
+
+    go_reader = tmp_path / "go_stream_reader_probe.go"
+    py_path_literal = json.dumps(py_path.as_posix())
+    go_reader.write_text(
+        textwrap.dedent(
+            f"""
+            package main
+
+            import (
+                "encoding/binary"
+                "encoding/json"
+                "log"
+                "math"
+                "os"
+
+                shard "github.com/phenomenon0/wshard/go/shard"
+            )
+
+            func floats(b []byte) []float64 {{
+                out := make([]float64, len(b)/4)
+                for i := range out {{
+                    out[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:])))
+                }}
+                return out
+            }}
+
+            func main() {{
+                ep, err := shard.OpenWShard({py_path_literal})
+                if err != nil {{
+                    log.Fatal(err)
+                }}
+                summary := map[string]any{{
+                    "id":       ep.ID,
+                    "env_id":   ep.EnvID,
+                    "length_t": ep.LengthT,
+                }}
+                for _, name := range []string{{"a", "b"}} {{
+                    ch := ep.Observations[name]
+                    if ch == nil {{
+                        log.Fatalf("missing observation %s", name)
+                    }}
+                    summary[name] = floats(ch.Data)
+                }}
+                if err := json.NewEncoder(os.Stdout).Encode(summary); err != nil {{
+                    log.Fatal(err)
+                }}
+            }}
+            """
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["go", "run", str(go_reader)],
+        cwd=_GO_MODULE_DIR,
+        check=True,
+        capture_output=True,
+        env=_go_env(),
+        text=True,
+    )
+    summary = json.loads(proc.stdout)
+    assert summary["id"] == "py-streamed"
+    assert summary["env_id"] == "PyStream-v0"
+    assert summary["length_t"] == T
+    np.testing.assert_array_equal(
+        np.array(summary["a"], dtype=np.float32).reshape(T, 2), exp_a
+    )
+    np.testing.assert_array_equal(
+        np.array(summary["b"], dtype=np.float32).reshape(T, 2), exp_b
+    )
+
+
+# ============================================================
+# 15. meta/provenance cross-language parity
+# ============================================================
+
+
+def _provenance_bytes(path) -> bytes:
+    """The raw meta/provenance block as it sits on disk, decompressed."""
+    return _read_blocks(_read_all(path), channels=[])[PROVENANCE_BLOCK]
+
+
+def _probe_provenance_fields():
+    """The same provenance values expressed for each language's constructor."""
+    return dict(
+        run_id="run-7f3a",
+        epoch=7,
+        first_seq=10001,
+        last_seq=20000,
+        start_state="aa" * 32,
+        end_state="bb" * 32,
+        prev_identity="cc" * 32,
+        source={"git_commit": "deadbeef", "schema_fp": "dd" * 32},
+    )
+
+
+def _episode_with_provenance(ep_id: str) -> Episode:
+    f = _probe_provenance_fields()
+    ep = Episode(id=ep_id, length=3)
+    ep.observations["state"] = Channel(
+        name="state",
+        dtype=DType.FLOAT32,
+        shape=[2],
+        data=np.arange(6, dtype=np.float32).reshape(3, 2),
+    )
+    ep.provenance = Provenance(**f)
+    return ep
+
+
+def test_provenance_roundtrips_and_identity_covers_it(tmp_path):
+    """Provenance survives a save/load, and meta/identity commits to it.
+
+    The second half is the point of writing provenance before identity: if the
+    identity did not cover it, anyone could rewrite which run produced an
+    episode and every checksum in the file would still verify.
+    """
+    ep = _episode_with_provenance("py-prov")
+    path = tmp_path / "prov.wshard"
+    save_wshard(ep, path)
+
+    assert load_wshard(path).provenance == ep.provenance
+    # Cheap read path returns the same value without decoding tensors.
+    assert episode_provenance(path) == ep.provenance
+
+    tampered = load_wshard(path)
+    tampered.provenance.run_id = "run-somebody-else"
+    other = tmp_path / "tampered.wshard"
+    save_wshard(tampered, other)
+    assert episode_identity(other) != episode_identity(path)
+
+
+def test_provenance_absent_when_unset(tmp_path):
+    ep = _episode_with_provenance("py-noprov")
+    ep.provenance = None
+    path = tmp_path / "noprov.wshard"
+    save_wshard(ep, path)
+    assert episode_provenance(path) is None
+    assert load_wshard(path).provenance is None
+
+
+def test_go_and_python_agree_on_provenance_block(tmp_path):
+    """Byte-identical meta/provenance from both writers, for equal values.
+
+    This is the whole claim of canonical JSON: the digest of a provenance is a
+    property of its value, not of which language rendered it. If Go's key order
+    or integer formatting drifted from Python's, two identical runs compacted
+    on different hosts would chain to different identities.
+    """
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
+
+    f = _probe_provenance_fields()
+
+    py_path = tmp_path / "py_prov.wshard"
+    save_wshard(_episode_with_provenance("shared"), py_path)
+
+    go_path = tmp_path / "go_prov.wshard"
+    probe = tmp_path / "go_prov_probe.go"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            package main
+
+            import (
+                "log"
+                shard "github.com/phenomenon0/wshard/go/shard"
+            )
+
+            func main() {{
+                ep := &shard.WShardEpisode{{
+                    ID:      "shared",
+                    LengthT: 3,
+                    Timebase: shard.WShardTimebase{{Type: "ticks", TickHz: 30}},
+                    Observations: map[string]*shard.WShardChannel{{
+                        "state": {{
+                            Name:  "state",
+                            DType: "float32",
+                            Shape: []int{{2}},
+                            Data:  make([]byte, 3*2*4),
+                        }},
+                    }},
+                    Provenance: &shard.WShardProvenance{{
+                        RunID:        {json.dumps(f["run_id"])},
+                        Epoch:        {f["epoch"]},
+                        FirstSeq:     {f["first_seq"]},
+                        LastSeq:      {f["last_seq"]},
+                        StartState:   {json.dumps(f["start_state"])},
+                        EndState:     {json.dumps(f["end_state"])},
+                        PrevIdentity: {json.dumps(f["prev_identity"])},
+                        Source: map[string]string{{
+                            "git_commit": {json.dumps(f["source"]["git_commit"])},
+                            "schema_fp":  {json.dumps(f["source"]["schema_fp"])},
+                        }},
+                    }},
+                }}
+                if err := shard.CreateWShard({json.dumps(go_path.as_posix())}, ep); err != nil {{
+                    log.Fatal(err)
+                }}
+            }}
+            """
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["go", "run", str(probe)],
+        cwd=_GO_MODULE_DIR,
+        check=True,
+        env=_go_env(),
+    )
+
+    assert _provenance_bytes(go_path) == _provenance_bytes(py_path)
+    # And Python decodes what Go wrote back to the same value.
+    assert episode_provenance(go_path) == Provenance(**f)
+
+
+def test_go_reads_python_provenance(tmp_path):
+    """The Go reader returns the same fields Python wrote."""
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
+
+    f = _probe_provenance_fields()
+    py_path = tmp_path / "py_for_go.wshard"
+    save_wshard(_episode_with_provenance("py-for-go"), py_path)
+
+    probe = tmp_path / "go_prov_reader.go"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            package main
+
+            import (
+                "encoding/json"
+                "fmt"
+                "log"
+                shard "github.com/phenomenon0/wshard/go/shard"
+            )
+
+            func main() {{
+                p, err := shard.EpisodeProvenance({json.dumps(py_path.as_posix())})
+                if err != nil {{
+                    log.Fatal(err)
+                }}
+                out, err := json.Marshal(map[string]any{{
+                    "run_id":        p.RunID,
+                    "epoch":         p.Epoch,
+                    "first_seq":     p.FirstSeq,
+                    "last_seq":      p.LastSeq,
+                    "start_state":   p.StartState,
+                    "end_state":     p.EndState,
+                    "prev_identity": p.PrevIdentity,
+                    "source":        p.Source,
+                }})
+                if err != nil {{
+                    log.Fatal(err)
+                }}
+                fmt.Println(string(out))
+            }}
+            """
+        ),
+        encoding="utf-8",
+    )
+    res = subprocess.run(
+        ["go", "run", str(probe)],
+        cwd=_GO_MODULE_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_go_env(),
+    )
+    assert json.loads(res.stdout.strip()) == f
+
+
+def test_provenance_chains_via_prev_identity(tmp_path):
+    """prev_identity turns a set of episodes into a chain.
+
+    This is what the manifest could not express: chunk N names the exact bytes
+    of chunk N-1, so a missing or swapped chunk is detectable without trusting
+    the manifest that lists them.
+    """
+    paths = []
+    prev = ""
+    for i in range(3):
+        ep = _episode_with_provenance(f"chunk-{i}")
+        ep.provenance.prev_identity = prev
+        ep.provenance.first_seq = i * 100
+        ep.provenance.last_seq = i * 100 + 99
+        path = tmp_path / f"chunk{i}.wshard"
+        save_wshard(ep, path)
+        paths.append(path)
+        prev = episode_identity(path)
+
+    # Walk the chain backwards, as a verifier would.
+    for i in range(2, 0, -1):
+        assert episode_provenance(paths[i]).prev_identity == episode_identity(paths[i - 1])
+    assert episode_provenance(paths[0]).prev_identity == ""
+
+
+def test_provenance_rejects_ints_past_2_53():
+    """Sequence numbers past 2^53 are refused, not silently turned into floats.
+
+    glyph SPEC-CANON §4 says an integer past 2^53 is an error, but the
+    from_json_loose path collapses it to float64 before canon_json can object:
+    2**53 and 2**53+1 both render 9.007199254740992e+15, so two different runs
+    would share a fingerprint. Go emits the exact int64 instead, so an
+    unguarded value diverges across languages as well.
+    """
+    from wshard.wshard import _provenance_block
+
+    safe = 2**53 - 1
+    _provenance_block(Provenance(last_seq=safe))  # boundary is allowed
+
+    for field in ("epoch", "first_seq", "last_seq"):
+        with pytest.raises(ValueError, match="2\\^53"):
+            _provenance_block(Provenance(**{field: 2**53}))
+        with pytest.raises(ValueError, match="2\\^53"):
+            _provenance_block(Provenance(**{field: -(2**53)}))
+
+
+def test_provenance_read_rejects_wrong_types():
+    """A file is a trust boundary, so the decoder refuses what it would not emit.
+
+    Go unmarshals into a typed struct and so refuses a string where int64 was
+    promised, by construction. Python's json.loads would happily hand back a
+    Provenance whose first_seq is "10001" -- which then compares, sorts, and
+    chains wrongly, and nothing upstream would say why. The two languages have
+    to reject the same files or "Go opened it" stops meaning anything.
+    """
+    from wshard.wshard import _provenance_from_block
+
+    def block(**over):
+        doc = {
+            "v": 1,
+            "run_id": "r",
+            "epoch": 1,
+            "first_seq": 1,
+            "last_seq": 2,
+            "start_state": "aa",
+            "end_state": "bb",
+            "prev_identity": "cc",
+            "source": {"k": "v"},
+        }
+        doc.update(over)
+        return json.dumps(doc).encode("utf-8")
+
+    _provenance_from_block(block())  # the well-formed one still decodes
+
+    for over, match in [
+        ({"v": 2}, "unsupported"),
+        ({"run_id": 7}, "run_id"),
+        ({"first_seq": "10001"}, "first_seq"),
+        ({"epoch": 1.5}, "epoch"),
+        ({"epoch": True}, "epoch"),  # bool is an int in Python, but not here
+        ({"last_seq": 2**53}, "2\\^53"),
+        ({"prev_identity": None}, "prev_identity"),
+        ({"source": ["k", "v"]}, "source"),
+        ({"source": {"k": 7}}, "source"),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            _provenance_from_block(block(**over))
+
+
+def test_provenance_max_safe_int_agrees_across_languages(tmp_path):
+    """At the 2^53 boundary Go and Python still emit the same bytes."""
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
+
+    safe = 2**53 - 1
+    ep = _episode_with_provenance("boundary")
+    ep.provenance = Provenance(run_id="b", epoch=safe, first_seq=safe, last_seq=safe)
+    py_path = tmp_path / "py_boundary.wshard"
+    save_wshard(ep, py_path)
+
+    go_path = tmp_path / "go_boundary.wshard"
+    probe = tmp_path / "go_boundary_probe.go"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            package main
+
+            import (
+                "log"
+                shard "github.com/phenomenon0/wshard/go/shard"
+            )
+
+            func main() {{
+                ep := &shard.WShardEpisode{{
+                    ID:      "boundary",
+                    LengthT: 3,
+                    Timebase: shard.WShardTimebase{{Type: "ticks", TickHz: 30}},
+                    Observations: map[string]*shard.WShardChannel{{
+                        "state": {{
+                            Name:  "state",
+                            DType: "float32",
+                            Shape: []int{{2}},
+                            Data:  make([]byte, 3*2*4),
+                        }},
+                    }},
+                    Provenance: &shard.WShardProvenance{{
+                        RunID:    "b",
+                        Epoch:    {safe},
+                        FirstSeq: {safe},
+                        LastSeq:  {safe},
+                    }},
+                }}
+                if err := shard.CreateWShard({json.dumps(go_path.as_posix())}, ep); err != nil {{
+                    log.Fatal(err)
+                }}
+            }}
+            """
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["go", "run", str(probe)], cwd=_GO_MODULE_DIR, check=True, env=_go_env()
+    )
+
+    assert _provenance_bytes(go_path) == _provenance_bytes(py_path)
+    assert episode_provenance(go_path).last_seq == safe
+
+
+# ============================================================
+# 16. Streaming writers seal across languages
+# ============================================================
+
+
+def test_go_stream_writer_seals_with_provenance(tmp_path):
+    """Go's streaming writer produces a file Python can verify and chain.
+
+    Streaming used to be the hole in the identity story -- a streamed episode
+    carried no seal at all, so nothing downstream could tell which run wrote it
+    or whether a block had been swapped since.
+    """
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
+
+    f = _probe_provenance_fields()
+    go_path = tmp_path / "go_stream.wshard"
+    probe = tmp_path / "go_stream_probe.go"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            package main
+
+            import (
+                "encoding/binary"
+                "log"
+                "math"
+                shard "github.com/phenomenon0/wshard/go/shard"
+            )
+
+            func main() {{
+                defs := []*shard.WShardChannelDef{{
+                    {{Name: "state", DType: "float32", Shape: []int{{2}}}},
+                }}
+                w, err := shard.NewWShardStreamWriter({json.dumps(go_path.as_posix())}, "go-stream", defs)
+                if err != nil {{
+                    log.Fatal(err)
+                }}
+                w.SetProvenance(&shard.WShardProvenance{{
+                    RunID:        {json.dumps(f["run_id"])},
+                    Epoch:        {f["epoch"]},
+                    FirstSeq:     {f["first_seq"]},
+                    LastSeq:      {f["last_seq"]},
+                    StartState:   {json.dumps(f["start_state"])},
+                    EndState:     {json.dumps(f["end_state"])},
+                    PrevIdentity: {json.dumps(f["prev_identity"])},
+                    Source: map[string]string{{
+                        "git_commit": {json.dumps(f["source"]["git_commit"])},
+                        "schema_fp":  {json.dumps(f["source"]["schema_fp"])},
+                    }},
+                }})
+                if err := w.BeginEpisode("GoEnv-v0", shard.WShardTimebase{{Type: "ticks", TickHz: 30}}); err != nil {{
+                    log.Fatal(err)
+                }}
+                for t := 0; t < 3; t++ {{
+                    obs := make([]byte, 8)
+                    binary.LittleEndian.PutUint32(obs[0:], math.Float32bits(float32(t)))
+                    binary.LittleEndian.PutUint32(obs[4:], math.Float32bits(float32(-t)))
+                    if err := w.WriteTimestep(t, map[string][]byte{{"state": obs}}, nil, float32(t), t == 2); err != nil {{
+                        log.Fatal(err)
+                    }}
+                }}
+                if _, err := w.EndEpisode(); err != nil {{
+                    log.Fatal(err)
+                }}
+            }}
+            """
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["go", "run", str(probe)], cwd=_GO_MODULE_DIR, check=True, env=_go_env()
+    )
+
+    assert verify_identity(go_path) == episode_identity(go_path)
+    assert episode_provenance(go_path) == Provenance(**f)
+    assert load_wshard(go_path).observations["state"].data.shape == (3, 2)
+
+
+def test_python_stream_writer_seals_for_go(tmp_path):
+    """The mirror: Go re-derives the identity Python's streaming writer sealed.
+
+    Python's writer hand-rolls the container rather than going through
+    save_wshard, so its leaves are computed on a different code path -- this is
+    the check that the two paths still agree.
+    """
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
+
+    from wshard import StreamChannelDef, WShardStreamWriter
+
+    f = _probe_provenance_fields()
+    py_path = tmp_path / "py_stream.wshard"
+    w = WShardStreamWriter(py_path, "py-stream", [StreamChannelDef("state", DType.FLOAT32, [2])])
+    w.begin_episode(env_id="PyEnv-v0")
+    for t in range(3):
+        w.write_timestep(
+            t=t,
+            observations={"state": np.array([t, -t], dtype=np.float32)},
+            actions={"state": np.array([t, -t], dtype=np.float32)},
+            reward=float(t),
+            done=(t == 2),
+        )
+    w.end_episode(provenance=Provenance(**f))
+    want = verify_identity(py_path)
+
+    probe = tmp_path / "go_verify_probe.go"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            package main
+
+            import (
+                "fmt"
+                "log"
+                shard "github.com/phenomenon0/wshard/go/shard"
+            )
+
+            func main() {{
+                got, err := shard.VerifyIdentity({json.dumps(py_path.as_posix())})
+                if err != nil {{
+                    log.Fatal(err)
+                }}
+                prov, err := shard.EpisodeProvenance({json.dumps(py_path.as_posix())})
+                if err != nil {{
+                    log.Fatal(err)
+                }}
+                fmt.Printf("%s %s\\n", got, prov.RunID)
+            }}
+            """
+        ),
+        encoding="utf-8",
+    )
+    out = subprocess.run(
+        ["go", "run", str(probe)],
+        cwd=_GO_MODULE_DIR,
+        check=True,
+        env=_go_env(),
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert out == [want, f["run_id"]]
+
+# ============================================================
+# 17. Canonical JSON escaping parity on hostile strings
+# ============================================================
+
+# Where Go's encoding/json and glyph's canon disagree, all reachable from
+# ordinary input: a channel id becomes a block name, and run_id and the source
+# map are free-form producer strings.
+#   U+2028      encoding/json escapes it, the canon writes it raw
+#   backspace   encoding/json writes \u0008, the canon writes \b
+#   formfeed    encoding/json writes \u000c, the canon writes \f
+# Not covered here: Go substitutes U+FFFD for invalid UTF-8 where the canon
+# passes the bytes through. A Python str cannot hold invalid UTF-8, so there is
+# no cross-language fixture for it; canonjson.go handles it by writing bytes.
+# Written as source escapes on purpose -- these bytes raw in a file are the kind
+# of thing an editor or a shell silently eats.
+_HOSTILE = "a\u2028b\bc\fde\u00e9"
+_HOSTILE_CHANNEL = "st" + _HOSTILE + "ate"
+
+
+def _hostile_provenance_fields():
+    f = _probe_provenance_fields()
+    f["run_id"] = "run-" + _HOSTILE
+    f["source"] = {"git_commit": "deadbeef", "note" + _HOSTILE: _HOSTILE}
+    return f
+
+
+def _hostile_episode(ep_id: str) -> Episode:
+    ep = Episode(id=ep_id, length=3)
+    ep.observations[_HOSTILE_CHANNEL] = Channel(
+        name=_HOSTILE_CHANNEL,
+        dtype=DType.FLOAT32,
+        shape=[2],
+        data=np.zeros((3, 2), dtype=np.float32),
+    )
+    ep.provenance = Provenance(**_hostile_provenance_fields())
+    return ep
+
+
+def test_hostile_strings_canonicalize_the_same_in_both_languages(tmp_path):
+    """A block name or provenance value that JSON writers disagree about must
+    still give one identity.
+
+    Both directions are checked byte for byte, because a parsed comparison
+    would not notice: an escaped U+2028 and a raw one decode to the same string
+    but hash differently, and the hash is the identity.
+    """
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    if not _GO_MODULE_DIR.exists():
+        pytest.skip(f"go module not present at {_GO_MODULE_DIR}")
+
+    f = _hostile_provenance_fields()
+    py_path = tmp_path / "py_hostile.wshard"
+    save_wshard(_hostile_episode("hostile"), py_path)
+    go_path = tmp_path / "go_hostile.wshard"
+
+    src_keys = sorted(f["source"])
+    probe = tmp_path / "go_hostile_probe.go"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            package main
+
+            import (
+                "fmt"
+                "log"
+                shard "github.com/phenomenon0/wshard/go/shard"
+            )
+
+            func main() {{
+                ep := &shard.WShardEpisode{{
+                    ID:       "hostile",
+                    LengthT:  3,
+                    Timebase: shard.WShardTimebase{{Type: "ticks", TickHz: 30}},
+                    Observations: map[string]*shard.WShardChannel{{
+                        {json.dumps(_HOSTILE_CHANNEL)}: {{
+                            Name:  {json.dumps(_HOSTILE_CHANNEL)},
+                            DType: "float32",
+                            Shape: []int{{2}},
+                            Data:  make([]byte, 3*2*4),
+                        }},
+                    }},
+                    Provenance: &shard.WShardProvenance{{
+                        RunID:        {json.dumps(f["run_id"])},
+                        Epoch:        {f["epoch"]},
+                        FirstSeq:     {f["first_seq"]},
+                        LastSeq:      {f["last_seq"]},
+                        StartState:   {json.dumps(f["start_state"])},
+                        EndState:     {json.dumps(f["end_state"])},
+                        PrevIdentity: {json.dumps(f["prev_identity"])},
+                        Source: map[string]string{{
+                            {json.dumps(src_keys[0])}: {json.dumps(f["source"][src_keys[0]])},
+                            {json.dumps(src_keys[1])}: {json.dumps(f["source"][src_keys[1]])},
+                        }},
+                    }},
+                }}
+                if err := shard.CreateWShard({json.dumps(go_path.as_posix())}, ep); err != nil {{
+                    log.Fatal(err)
+                }}
+                // VerifyIdentity byte-compares its own re-encoding of the leaf
+                // map against the block Python wrote, so it fails outright if
+                // the two canons disagree.
+                got, err := shard.VerifyIdentity({json.dumps(py_path.as_posix())})
+                if err != nil {{
+                    log.Fatal(err)
+                }}
+                fmt.Println(got)
+            }}
+            """
+        ),
+        encoding="utf-8",
+    )
+    out = subprocess.run(
+        ["go", "run", str(probe)],
+        cwd=_GO_MODULE_DIR,
+        check=True,
+        env=_go_env(),
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Go accepted Python's meta/identity bytes and agrees on the digest.
+    assert out == episode_identity(py_path)
+
+    # The mirror: Python re-derives Go's meta/identity block byte for byte.
+    go_blocks = _read_blocks(_read_all(go_path))
+    assert _identity_block(go_blocks) == go_blocks[IDENTITY_BLOCK]
+
+    # And meta/provenance, which is where the free-form strings live.
+    assert go_blocks[PROVENANCE_BLOCK] == _provenance_bytes(py_path)
+    assert episode_provenance(go_path) == Provenance(**f)
+    assert b"\\u2028" not in _provenance_bytes(py_path)

@@ -204,6 +204,37 @@ class Residual:
 
 
 @dataclass
+class Provenance:
+    """Where an episode came from: which run, which slice of it, what it left.
+
+    Serialized to the ``meta/provenance`` block in glyph canonical JSON, so
+    ``sha256`` of that block is the glyph fingerprint of this value. Written
+    before ``meta/identity``, which therefore commits to it -- editing
+    provenance after the fact breaks ``verify_identity``.
+
+    ``prev_identity`` is the ``episode_identity`` of the preceding episode of
+    the same run, which is what turns a set of chunks into a chain. Empty means
+    "first, or unchained".
+
+    Every field is always written, even when empty: an omitted key and a key
+    holding "" are different canonical JSON, so omitting would make two equal
+    provenances hash differently across producers.
+    """
+
+    run_id: str = ""
+    epoch: int = 0
+    first_seq: int = 0
+    last_seq: int = 0
+    start_state: str = ""  # 64-hex glyph fingerprint of state before first_seq
+    end_state: str = ""  # 64-hex glyph fingerprint of state after last_seq
+    prev_identity: str = ""  # 64-hex episode_identity of the preceding episode
+    # Free-form producer facts: git_commit, schema_fp, and whatever a later
+    # producer needs. A string map rather than a struct so both languages sort
+    # its keys the same way without anyone maintaining a field order.
+    source: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class Episode:
     """
     Universal episode interchange format.
@@ -246,6 +277,9 @@ class Episode:
     # Source format (set on load, informational)
     source_format: Format = Format.UNKNOWN
 
+    # Run provenance (meta/provenance). None means the block is not written.
+    provenance: Optional[Provenance] = None
+
     # Chunked episode fields (Gap 1)
     chunk_index: Optional[int] = None
     total_chunks: Optional[int] = None
@@ -270,12 +304,23 @@ class Episode:
 
         # Validate chunk fields if present
         if self.chunk_index is not None:
-            if self.total_chunks is None or self.total_chunks <= 0:
-                raise ValueError("total_chunks required when chunk_index is set")
-            if self.chunk_index < 0 or self.chunk_index >= self.total_chunks:
-                raise ValueError(
-                    f"chunk_index {self.chunk_index} out of range [0, {self.total_chunks})"
-                )
+            if self.chunk_index < 0:
+                raise ValueError(f"chunk_index must be >= 0, got {self.chunk_index}")
+            # total_chunks is optional. A writer emitting chunks as they are
+            # produced does not know the total until it finalizes, and the
+            # manifest is what records it -- requiring it here made
+            # ChunkedEpisodeWriter.write_chunk unusable on its own. Go writes
+            # the field omitempty for the same reason.
+            if self.total_chunks is not None:
+                if self.total_chunks <= 0:
+                    raise ValueError(
+                        f"total_chunks must be > 0, got {self.total_chunks}"
+                    )
+                if self.chunk_index >= self.total_chunks:
+                    raise ValueError(
+                        f"chunk_index {self.chunk_index} out of range "
+                        f"[0, {self.total_chunks})"
+                    )
             if self.timestep_range is not None:
                 if len(self.timestep_range) != 2:
                     raise ValueError("timestep_range must be [start_t, end_t]")

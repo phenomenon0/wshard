@@ -783,6 +783,13 @@ func (w *ShardWriter) Close() error {
 			w.header.TotalFileSize, currentPos)
 	}
 
+	// Flushed before the close, not left to the page cache. This file is the
+	// published artifact: on a crash a reader finds it at full length with a
+	// valid header and short or zero data, and the index says nothing is wrong.
+	if err := w.file.Sync(); err != nil {
+		w.file.Close()
+		return err
+	}
 	return w.file.Close()
 }
 
@@ -1080,6 +1087,13 @@ func (sw *ShardStreamWriter) Finalize() error {
 		}
 	}
 
+	// Flushed before the close, not left to the page cache. This file is the
+	// published artifact: on a crash a reader finds it at full length with a
+	// valid header and short or zero data, and the index says nothing is wrong.
+	if err := sw.file.Sync(); err != nil {
+		sw.file.Close()
+		return err
+	}
 	return sw.file.Close()
 }
 

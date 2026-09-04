@@ -17,6 +17,7 @@ package shard
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -45,6 +46,7 @@ type WShardEpisode struct {
 	TotalChunks   *int
 	TimestepRange [2]int
 	Metadata      map[string]any
+	Provenance    *WShardProvenance // nil means the block is not written
 }
 
 // WShardResidual holds a compact residual encoding for a channel.
@@ -344,6 +346,18 @@ func CreateWShard(path string, ep *WShardEpisode) error {
 		}
 	}
 
+	if ep.Provenance != nil {
+		provJSON, err := provenanceBlockBytes(ep.Provenance)
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("wshard: marshal %s: %w", ProvenanceBlock, err)
+		}
+		if err := put(ProvenanceBlock, provJSON, ContentTypeJSON); err != nil {
+			cleanup()
+			return fmt.Errorf("wshard: write %s: %w", ProvenanceBlock, err)
+		}
+	}
+
 	identity, err := identityBlockBytes(leaves)
 	if err != nil {
 		cleanup()
@@ -395,6 +409,16 @@ func OpenWShard(path string) (*WShardEpisode, error) {
 	chanRaw, err := r.ReadEntryByName("meta/channels")
 	if err != nil {
 		return nil, fmt.Errorf("wshard: read meta/channels: %w", err)
+	}
+
+	var provenance *WShardProvenance
+	if provRaw, err := r.ReadEntryByName(ProvenanceBlock); err == nil {
+		provenance, err = parseProvenance(provRaw)
+		if err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, ErrEntryNotFound) {
+		return nil, fmt.Errorf("wshard: read %s: %w", ProvenanceBlock, err)
 	}
 
 	observations := make(map[string]*WShardChannel)
@@ -545,6 +569,7 @@ func OpenWShard(path string) (*WShardEpisode, error) {
 		TotalChunks:   epMeta.TotalChunks,
 		TimestepRange: epMeta.TimestepRange,
 		Metadata:      epMeta.Metadata,
+		Provenance:    provenance,
 	}, nil
 }
 

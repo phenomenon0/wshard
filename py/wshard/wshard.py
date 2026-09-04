@@ -13,6 +13,7 @@ Container format: Shard v2 with role=0x05
 import hashlib
 import io
 import json
+import os
 import struct
 from pathlib import Path
 from typing import Union, BinaryIO, Dict, Any, Optional, List
@@ -22,7 +23,17 @@ import crc32c
 import xxhash
 from glyph import canon_json, from_json_loose, is_canonical
 
-from .types import Episode, Channel, DType, Format, TimebaseSpec, TimebaseType, Residual, Modality
+from .types import (
+    Episode,
+    Channel,
+    DType,
+    Format,
+    TimebaseSpec,
+    TimebaseType,
+    Residual,
+    Modality,
+    Provenance,
+)
 from .compress import (
     CompressionType,
     CompressionLevel,
@@ -60,11 +71,18 @@ DEFAULT_ALIGNMENT = 32
 # Identity leaf map over every other block's uncompressed bytes (glyph
 # SPEC-CANON.md §4): {"v":1,"leaf":"sha256","entries":{name: hex}} as canonical
 # JSON, so sha256(block) == glyph.fingerprint(value). Written last by
-# _encode_wshard. ponytail: flat leaf map; switch to an RFC 6962 tree when a
-# dataset needs O(log n) proofs. streaming.WShardStreamWriter writes no
-# identity yet; add per-block incremental sha256 there when streamed files
-# need one.
+# _encode_wshard, and by streaming.WShardStreamWriter.end_episode from leaves
+# it hashes per block as it writes. ponytail: flat leaf map; switch to an
+# RFC 6962 tree when a dataset needs O(log n) proofs.
 IDENTITY_BLOCK = "meta/identity"
+
+# Run provenance: which run and epoch produced this episode, which sequence
+# range it covers, the state fingerprints it starts and ends on, and the
+# identity of the episode before it. Canonical JSON like the identity block, so
+# sha256(block) == glyph.fingerprint(value). Written immediately before
+# meta/identity so the identity commits to it. Optional: files without a
+# producer that knows these facts simply omit the block.
+PROVENANCE_BLOCK = "meta/provenance"
 
 
 def _channel_filter_keep(name: str, allowed: set) -> bool:
@@ -81,9 +99,9 @@ def _channel_filter_keep(name: str, allowed: set) -> bool:
         return True
     for lane in ("signal/", "action/", "omen/", "uncert/"):
         if name.startswith(lane):
-            return name[len(lane):] in allowed
+            return name[len(lane) :] in allowed
     if name.startswith("residual/"):
-        rest = name[len("residual/"):]
+        rest = name[len("residual/") :]
         ch_id = rest.split("/", 1)[0]
         return ch_id in allowed
     # Unknown prefix: keep to be safe.
@@ -153,7 +171,13 @@ def save_wshard(
     if isinstance(path_or_file, (str, Path)):
         with open(path_or_file, "wb") as f:
             f.write(data)
+            # On the disk before the handle closes, not left in the page cache.
+            # A crash otherwise leaves a full-length file carrying a valid header
+            # over short or zero data, and the index reports nothing wrong.
+            f.flush()
+            os.fsync(f.fileno())
     else:
+        # Caller owns the handle, so it owns the durability too.
         path_or_file.write(data)
 
 
@@ -220,7 +244,9 @@ def _read_blocks(data: bytes, channels: Optional[List[str]] = None) -> Dict[str,
             continue
 
         # Skip blocks excluded by channel filter (saves decompression CPU).
-        if channel_filter is not None and not _channel_filter_keep(name, channel_filter):
+        if channel_filter is not None and not _channel_filter_keep(
+            name, channel_filter
+        ):
             continue
 
         # Read block data (data_offset is absolute in Go format)
@@ -263,13 +289,106 @@ def _decode_wshard(data: bytes, channels: Optional[List[str]] = None) -> Episode
     return _episode_from_blocks(_read_blocks(data, channels))
 
 
+# glyph SPEC-CANON.md §4 makes an integer past this an error rather than a
+# silent float64 collapse, but the from_json_loose path reaches canon_json as a
+# float and never raises: 2**53 and 2**53+1 both render 9.007199254740992e+15
+# and so share a fingerprint. Provenance is the first block to carry integers
+# that could plausibly get there, so it checks its own before encoding.
+_MAX_SAFE_INT = 2**53 - 1
+
+
+def _check_safe_int(field: str, value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(
+            f"provenance {field} must be an int, got {type(value).__name__}"
+        )
+    if abs(value) > _MAX_SAFE_INT:
+        raise ValueError(
+            f"provenance {field}={value} exceeds +/-2^53; canonical JSON would "
+            "render it as a float and lose the exact value"
+        )
+    return value
+
+
+def _provenance_block(prov: Provenance) -> bytes:
+    doc = {
+        "v": 1,
+        "run_id": prov.run_id,
+        "epoch": _check_safe_int("epoch", prov.epoch),
+        "first_seq": _check_safe_int("first_seq", prov.first_seq),
+        "last_seq": _check_safe_int("last_seq", prov.last_seq),
+        "start_state": prov.start_state,
+        "end_state": prov.end_state,
+        "prev_identity": prov.prev_identity,
+        "source": dict(prov.source),
+    }
+    return canon_json(from_json_loose(doc)).encode("utf-8")
+
+
+def _check_str(field: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            f"provenance {field} must be a string, got {type(value).__name__}"
+        )
+    return value
+
+
+def _provenance_from_block(data: bytes) -> Provenance:
+    """Decode meta/provenance, rejecting anything the encoder would not emit.
+
+    A file is a trust boundary: Go's json.Unmarshal refuses a wrong-typed field
+    by construction, so Python checks rather than handing a caller a Provenance
+    whose first_seq is a string.
+    """
+    doc = json.loads(data.decode("utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError(f"meta/provenance must be an object, got {type(doc).__name__}")
+    v = doc.get("v")
+    if v != 1:
+        raise ValueError(f"unsupported meta/provenance version: {v!r}")
+
+    source = doc.get("source", {})
+    if source is None:
+        source = {}
+    if not isinstance(source, dict):
+        raise ValueError(
+            f"provenance source must be an object, got {type(source).__name__}"
+        )
+    for k, val in source.items():
+        _check_str(f"source[{k!r}]", val)
+
+    return Provenance(
+        run_id=_check_str("run_id", doc.get("run_id", "")),
+        epoch=_check_safe_int("epoch", doc.get("epoch", 0)),
+        first_seq=_check_safe_int("first_seq", doc.get("first_seq", 0)),
+        last_seq=_check_safe_int("last_seq", doc.get("last_seq", 0)),
+        start_state=_check_str("start_state", doc.get("start_state", "")),
+        end_state=_check_str("end_state", doc.get("end_state", "")),
+        prev_identity=_check_str("prev_identity", doc.get("prev_identity", "")),
+        source=dict(source),
+    )
+
+
 def _identity_leaves(blocks: Dict[str, bytes]) -> Dict[str, str]:
-    return {n: hashlib.sha256(b).hexdigest() for n, b in blocks.items() if n != IDENTITY_BLOCK}
+    return {
+        n: hashlib.sha256(b).hexdigest()
+        for n, b in blocks.items()
+        if n != IDENTITY_BLOCK
+    }
+
+
+def _identity_block_from_leaves(leaves: Dict[str, str]) -> bytes:
+    """Build the identity block from an already-computed leaf map.
+
+    streaming.WShardStreamWriter hashes each block as it writes it and drops the
+    bytes, so it never has the ``blocks`` dict _identity_block wants.
+    """
+    doc = {"v": 1, "leaf": "sha256", "entries": dict(leaves)}
+    return canon_json(from_json_loose(doc)).encode("utf-8")
 
 
 def _identity_block(blocks: Dict[str, bytes]) -> bytes:
-    doc = {"v": 1, "leaf": "sha256", "entries": _identity_leaves(blocks)}
-    return canon_json(from_json_loose(doc)).encode("utf-8")
+    return _identity_block_from_leaves(_identity_leaves(blocks))
 
 
 def _read_all(path_or_file: Union[str, Path, BinaryIO]) -> bytes:
@@ -290,13 +409,50 @@ def episode_identity(path_or_file: Union[str, Path, BinaryIO]) -> str:
     return hashlib.sha256(blocks[IDENTITY_BLOCK]).hexdigest()
 
 
-def verify_identity(path_or_file: Union[str, Path, BinaryIO]) -> str:
+def episode_provenance(
+    path_or_file: Union[str, Path, BinaryIO],
+) -> Optional[Provenance]:
+    """Read just the ``meta/provenance`` block, or None if the file has none.
+
+    Decodes no tensors, so walking a ``prev_identity`` chain is cheap in CPU.
+    Note it still reads the whole file's bytes, as ``episode_identity`` does;
+    Go's ``EpisodeProvenance`` seeks to the single entry instead.
+    """
+    blocks = _read_blocks(_read_all(path_or_file), channels=[])
+    if PROVENANCE_BLOCK not in blocks:
+        return None
+    return _provenance_from_block(blocks[PROVENANCE_BLOCK])
+
+
+def verify_identity(
+    path_or_file: Union[str, Path, BinaryIO],
+    expected: Optional[str] = None,
+) -> str:
     """Re-hash every block and check it against ``meta/identity``; return the identity.
 
     CRC32C only proves a block matches its own index entry, which whoever edits
     the file can rewrite. This proves every block matches what the identity
     committed to. Raises ValueError naming the first block that differs.
+
+    Two different questions, and which one you asked depends on ``expected``:
+
+    - Omitted, this proves the file is *internally consistent* — not bit-rotted,
+      truncated or partially written, across recompression, which CRC32C cannot
+      do. It proves nothing about origin: whoever rewrote a block also rewrote
+      ``meta/identity``, and the file re-verifies happily.
+    - Given the 64-hex you obtained *out of band* — a signature, a manifest, a
+      git commit, the ``prev_identity`` of the next chunk — this additionally
+      proves the file is the one that identity names. That is the check that
+      detects an edit, and it is the reason to prefer this over CRC32C.
+
+    Raises ValueError on a mismatch against ``expected``.
     """
+    if expected is not None:
+        expected = expected.strip().lower()
+        if len(expected) != 64 or not all(c in "0123456789abcdef" for c in expected):
+            raise ValueError(
+                f"expected must be 64 hex characters, got {expected!r}"
+            )
     blocks = _read_blocks(_read_all(path_or_file))
     ident = blocks.get(IDENTITY_BLOCK)
     if ident is None:
@@ -310,7 +466,13 @@ def verify_identity(path_or_file: Union[str, Path, BinaryIO]) -> str:
             raise ValueError(
                 f"identity mismatch at {name}: committed {want.get(name)}, file has {got.get(name)}"
             )
-    return hashlib.sha256(ident).hexdigest()
+    identity = hashlib.sha256(ident).hexdigest()
+    if expected is not None and identity != expected:
+        raise ValueError(
+            f"identity is {identity}, expected {expected}: the file is "
+            f"internally consistent but is not the one that identity names"
+        )
+    return identity
 
 
 def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
@@ -446,6 +608,9 @@ def _episode_from_blocks(blocks: Dict[str, bytes]) -> Episode:
             )
             ep.metadata.setdefault("_residual_encoding", residual_encoding)
 
+    if PROVENANCE_BLOCK in blocks:
+        ep.provenance = _provenance_from_block(blocks[PROVENANCE_BLOCK])
+
     return ep
 
 
@@ -503,7 +668,9 @@ def _decode_wshard_streaming(path: str, channel_filter: set) -> Episode:
                     block_comp_type = CompressionType.ZSTD
                 else:
                     block_comp_type = compression_default
-                block_data = Compressor(block_comp_type).decompress(block_data, orig_size)
+                block_data = Compressor(block_comp_type).decompress(
+                    block_data, orig_size
+                )
 
             checksum = entry["checksum"]
             if checksum != 0:
@@ -533,7 +700,9 @@ def _encode_wshard(
         "wshard_version": "0.1",
         "endianness": "little",
         "alignment": 32,
-        "residual_encoding": RESIDUAL_ENCODING_COWRIE_BITMASK if HAS_COWRIE else RESIDUAL_ENCODING_RAW,
+        "residual_encoding": RESIDUAL_ENCODING_COWRIE_BITMASK
+        if HAS_COWRIE
+        else RESIDUAL_ENCODING_RAW,
     }
     # Omen blocks are raw tensor bytes on disk (matching the Go writer, which
     # records no dtype/shape for them). Record dtype/shape here so the Python
@@ -541,11 +710,13 @@ def _encode_wshard(
     omen_channel_defs = []
     for ch_id, models in ep.omens.items():
         for model_id, ch in models.items():
-            omen_channel_defs.append({
-                "block": f"omen/{ch_id}/{model_id}",
-                "dtype": ch.dtype.value,
-                "shape": ch.shape,
-            })
+            omen_channel_defs.append(
+                {
+                    "block": f"omen/{ch_id}/{model_id}",
+                    "dtype": ch.dtype.value,
+                    "shape": ch.shape,
+                }
+            )
     if omen_channel_defs:
         meta_wshard["omen_channels"] = omen_channel_defs
     blocks["meta/wshard"] = json.dumps(meta_wshard).encode("utf-8")
@@ -648,7 +819,11 @@ def _encode_wshard(
     ticks = np.arange(ep.length, dtype=np.int32)
     blocks["time/ticks"] = ticks.tobytes()
 
-    # Written last: commits to every other block's uncompressed bytes.
+    if ep.provenance is not None:
+        blocks[PROVENANCE_BLOCK] = _provenance_block(ep.provenance)
+
+    # Written last: commits to every other block's uncompressed bytes,
+    # meta/provenance included.
     blocks[IDENTITY_BLOCK] = _identity_block(blocks)
 
     # Sort block names for consistent ordering
@@ -828,6 +1003,7 @@ def _parse_tensor_block(data: bytes, ch_def: Dict) -> Channel:
 # Gap 5: VLA Multi-Modal helpers
 # ============================================================
 
+
 def add_multimodal_observation(
     ep: Episode,
     group: str,
@@ -961,10 +1137,6 @@ def decode_residuals(ep: Episode) -> None:
     for ch_id, residual in ep.residuals.items():
         if residual.type == "sign2nddiff":
             if encoding == RESIDUAL_ENCODING_COWRIE_BITMASK and HAS_COWRIE:
-                residual.mask = bytes(unpack_residual_bitmask(
-                    residual.data, ep.length
-                ))
+                residual.mask = bytes(unpack_residual_bitmask(residual.data, ep.length))
             else:
-                residual.mask = bytes(unpack_residual_bitmask(
-                    residual.data, ep.length
-                ))
+                residual.mask = bytes(unpack_residual_bitmask(residual.data, ep.length))

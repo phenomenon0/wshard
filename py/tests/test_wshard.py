@@ -931,11 +931,27 @@ class TestChunkedEpisodes:
         )
         ep.validate()
 
+    def test_chunk_index_without_total_is_valid(self):
+        """A chunk may not know the total yet.
+
+        write_chunk emits chunks as they are produced, so the total is only
+        known once the manifest is finalized. Requiring it here would make the
+        incremental writer unusable, and Go accepts the same shape.
+        """
+        ep = Episode(id="streamed", length=10, chunk_index=0)
+        assert ep.is_chunked
+        ep.validate()
+
     def test_chunk_validation_errors(self):
         """Test chunk field validation."""
-        # chunk_index without total_chunks
-        ep = Episode(id="bad", length=10, chunk_index=0)
-        with pytest.raises(ValueError, match="total_chunks required"):
+        # negative chunk_index
+        ep = Episode(id="bad", length=10, chunk_index=-1)
+        with pytest.raises(ValueError, match="chunk_index must be >= 0"):
+            ep.validate()
+
+        # non-positive total_chunks
+        ep = Episode(id="bad", length=10, chunk_index=0, total_chunks=0)
+        with pytest.raises(ValueError, match="total_chunks must be > 0"):
             ep.validate()
 
         # chunk_index out of range
@@ -1013,6 +1029,48 @@ class TestChunkedEpisodes:
 
             np.testing.assert_array_almost_equal(
                 all_obs, np.arange(T, dtype=np.float32),
+            )
+
+    def test_write_chunk_incremental(self):
+        """Chunks written one at a time, without knowing the total up front.
+
+        This is the documented ChunkedEpisodeWriter usage and the one that has
+        no way to supply total_chunks: the writer only learns it at
+        finalize_manifest, which is where it lands. Covers the path that was
+        unreachable while Episode.validate demanded the field.
+        """
+        from wshard import ChunkedEpisodeWriter, ChunkedEpisodeReader
+        from wshard.chunked import validate_chunk_continuity
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = ChunkedEpisodeWriter(tmpdir, "live-ep", chunk_size_t=10)
+
+            for ci in range(3):
+                chunk = Episode(id="live-ep", length=10, env_id="Live-v0")
+                chunk.observations["s"] = Channel(
+                    name="s", dtype=DType.FLOAT32, shape=[],
+                    data=np.arange(ci * 10, ci * 10 + 10, dtype=np.float32),
+                )
+                writer.write_chunk(chunk)
+                # write_chunk stamps the index and leaves the total unknown --
+                # nothing downstream can fill it in afterwards, because
+                # meta/identity commits to meta/episode.
+                assert chunk.chunk_index == ci
+                assert chunk.total_chunks is None
+
+            manifest_path = writer.finalize_manifest()
+
+            # The total the chunks could not carry is recorded here, once.
+            validate_chunk_continuity(writer.manifest)
+            assert all(c["total_chunks"] == 3 for c in writer.manifest.chunks)
+
+            reader = ChunkedEpisodeReader(str(manifest_path))
+            assert reader.num_chunks == 3
+            all_obs = []
+            for chunk_ep in reader.iter_chunks():
+                all_obs.extend(chunk_ep.observations["s"].data.tolist())
+            np.testing.assert_array_almost_equal(
+                all_obs, np.arange(30, dtype=np.float32),
             )
 
     def test_single_chunk_backward_compat(self):
@@ -1171,9 +1229,10 @@ if __name__ == "__main__":
 # Identity (meta/identity, glyph SPEC-CANON.md §4)
 # ============================================================
 
+import hashlib
 import struct as _struct
 
-from wshard import episode_identity, verify_identity
+from wshard import Provenance, episode_identity, verify_identity
 from wshard.wshard import (
     HEADER_SIZE,
     INDEX_ENTRY_SIZE,
@@ -1205,6 +1264,75 @@ def _identity_episode(T=20):
 
 
 class TestIdentity:
+    def test_seal_reaches_a_sidecar_through_provenance(self, tmp_path):
+        """A sidecar file can be brought under the episode identity.
+
+        No video block type exists, so camera-heavy pipelines keep an MP4
+        beside the .wshard. A bare path would leave the video outside the seal,
+        which is the format's main claim. Putting the video's sha256 in
+        provenance.source chains it in: identity -> meta/provenance -> video
+        sha256 -> video bytes. This test pins that a changed video moves the
+        episode identity, because that is the property the FAQ promises.
+
+        Episode.metadata is deliberately not used here: it is not written to the
+        file at all, so it cannot carry anything into the seal.
+        """
+        video = tmp_path / "cam.mp4"
+        video.write_bytes(b"frame-A")
+
+        def seal(name):
+            ep = _identity_episode()
+            ep.provenance = Provenance(
+                run_id="run-42",
+                source={"video_path": video.name,
+                        "video_sha256": hashlib.sha256(video.read_bytes()).hexdigest()},
+            )
+            p = tmp_path / name
+            save_wshard(ep, p)
+            return verify_identity(p)
+
+        before = seal("a.wshard")
+        video.write_bytes(b"frame-B")   # one frame differs
+        after = seal("b.wshard")
+        assert before != after, "editing the sidecar must move the episode identity"
+
+        # Episode.metadata cannot do this job: it never reaches the file.
+        ep = _identity_episode()
+        ep.metadata = {"video_sha256": "deadbeef"}
+        q = tmp_path / "c.wshard"
+        save_wshard(ep, q)
+        assert load_wshard(q).metadata == {}
+
+    def test_verify_against_expected_is_the_check_that_detects_an_edit(self, tmp_path):
+        """verify_identity(path) and verify_identity(path, expected) differ in kind.
+
+        An attacker who rewrites a block also reseals meta/identity, so the file
+        re-verifies against itself happily -- self-verification proves internal
+        consistency (no bit rot, no truncation) and nothing about origin. Only
+        comparing against a 64-hex obtained out of band detects the edit. This
+        test pins that difference, because an API where the reachable call is
+        the one that proves nothing is a footgun.
+        """
+        ep = _identity_episode()
+        p = tmp_path / "e.wshard"
+        save_wshard(ep, p)
+        sealed = verify_identity(p)
+
+        # The out-of-band value matches: strongest check passes.
+        assert verify_identity(p, expected=sealed) == sealed
+        assert verify_identity(p, expected=sealed.upper()) == sealed
+
+        # A different episode is internally consistent but is not that identity.
+        other = _identity_episode(T=21)
+        q = tmp_path / "other.wshard"
+        save_wshard(other, q)
+        assert verify_identity(q) != sealed          # self-check still passes
+        with pytest.raises(ValueError, match="is not the one that identity names"):
+            verify_identity(q, expected=sealed)
+
+        with pytest.raises(ValueError, match="64 hex characters"):
+            verify_identity(p, expected="abc")
+
     def test_identity_is_content_not_layout(self, tmp_path):
         """Same episode under three codecs: disk bytes differ, identity must not.
         One content change must move it."""
@@ -1243,3 +1371,124 @@ class TestIdentity:
         load_wshard(p)  # CRC matches: the container cannot tell
         with pytest.raises(ValueError, match="signal/state"):
             verify_identity(p)
+
+
+# ============================================================
+# Streaming and chunked writers seal what they write
+# ============================================================
+
+from dataclasses import replace as _replace
+
+from wshard import (
+    ChunkedEpisodeReader,
+    ChunkedEpisodeWriter,
+    Provenance,
+    StreamChannelDef,
+    WShardStreamWriter,
+    episode_provenance,
+)
+from wshard.chunked import validate_chunk_chain
+
+
+def _stream_to(path, compression, provenance):
+    """Write a fixed 8-step episode with the streaming writer; return its identity."""
+    w = WShardStreamWriter(
+        path,
+        "streamed",
+        [StreamChannelDef("state", DType.FLOAT32, [2])],
+        compression=compression,
+    )
+    w.begin_episode(env_id="Env-v0")
+    for t in range(8):
+        w.write_timestep(
+            t=t,
+            observations={"state": np.full(2, t, dtype=np.float32)},
+            actions={"state": np.full(2, -t, dtype=np.float32)},
+            reward=float(t),
+            done=(t == 7),
+        )
+    w.end_episode(provenance=provenance)
+    return verify_identity(path)  # raises if any block disagrees with the seal
+
+
+class TestStreamedIdentity:
+    def test_streamed_file_is_sealed(self, tmp_path):
+        """A streamed episode gets the same guarantee a batch-written one does:
+        every block committed to, and the identity over content, not layout."""
+        prov = Provenance(run_id="run-a", epoch=1, first_seq=0, last_seq=7)
+        plain = tmp_path / "none.wshard"
+        a = _stream_to(plain, CompressionType.NONE, prov)
+        b = _stream_to(tmp_path / "zstd.wshard", CompressionType.ZSTD, prov)
+        assert a == b == episode_identity(plain)
+        assert episode_provenance(plain) == prov
+
+    def test_streamed_identity_covers_provenance(self, tmp_path):
+        """Same tensors, different run: meta/identity commits to meta/provenance,
+        so the two files are not the same episode. And an unprovenanced stream
+        still seals -- it is just a different (unchained) episode."""
+        prov = Provenance(run_id="run-a", epoch=1, first_seq=0, last_seq=7)
+        a = _stream_to(tmp_path / "a.wshard", CompressionType.NONE, prov)
+        b = _stream_to(tmp_path / "b.wshard", CompressionType.NONE,
+                       _replace(prov, run_id="run-b"))
+        bare = _stream_to(tmp_path / "bare.wshard", CompressionType.NONE, None)
+        assert len({a, b, bare}) == 3
+
+
+class TestChunkChain:
+    def _episode(self, T=9):
+        ep = Episode(id="chained", length=T, env_id="Test-v0")
+        ep.observations["s"] = Channel(
+            name="s", dtype=DType.FLOAT32, shape=[],
+            data=np.arange(T, dtype=np.float32),
+        )
+        ep.actions["a"] = Channel(
+            name="a", dtype=DType.FLOAT32, shape=[],
+            data=np.zeros(T, dtype=np.float32),
+        )
+        ep.provenance = Provenance(run_id="run-x", epoch=2, first_seq=100, last_seq=108,
+                                   start_state="a" * 64, end_state="b" * 64)
+        return ep
+
+    def test_chunks_link_to_their_predecessor(self, tmp_path):
+        """Each chunk's meta/provenance names the identity of the chunk before it,
+        which is what makes a directory of chunks a chain rather than a pile."""
+        writer = ChunkedEpisodeWriter(str(tmp_path), "chained", chunk_size_t=4)
+        writer.write_episode_chunked(self._episode())
+        writer.finalize_manifest()
+
+        entries = sorted(writer.manifest.chunks, key=lambda c: c["chunk_index"])
+        assert [e["identity"] for e in entries] == [
+            episode_identity(tmp_path / e["uri"]) for e in entries
+        ]
+        provs = [episode_provenance(tmp_path / e["uri"]) for e in entries]
+        assert provs[0].prev_identity == ""
+        for prev, cur in zip(entries, provs[1:]):
+            assert cur.prev_identity == prev["identity"]
+
+        # Sequence numbers walk the run, and only the ends carry boundary state.
+        assert [(p.first_seq, p.last_seq) for p in provs] == [(100, 103), (104, 107), (108, 108)]
+        assert provs[0].start_state == "a" * 64 and provs[0].end_state == ""
+        assert provs[-1].end_state == "b" * 64 and provs[-1].start_state == ""
+
+        validate_chunk_chain(writer.manifest, str(tmp_path))
+        assert len(list(ChunkedEpisodeReader(str(tmp_path / "chained_manifest.wshard")).iter_chunks())) == 3
+
+    def test_swapped_chunk_breaks_the_chain(self, tmp_path):
+        """A chunk from another run has a valid identity and passes its own
+        verify_identity -- only the chain catches that it does not belong here."""
+        writer = ChunkedEpisodeWriter(str(tmp_path), "chained", chunk_size_t=4)
+        writer.write_episode_chunked(self._episode())
+        writer.finalize_manifest()
+
+        other = tmp_path / "other"
+        other_writer = ChunkedEpisodeWriter(str(other), "chained", chunk_size_t=4)
+        ep = self._episode()
+        ep.provenance = _replace(ep.provenance, run_id="run-y")
+        other_writer.write_episode_chunked(ep)
+
+        target = tmp_path / writer.manifest.chunks[1]["uri"]
+        target.write_bytes((other / other_writer.manifest.chunks[1]["uri"]).read_bytes())
+        verify_identity(target)  # intact in itself
+
+        with pytest.raises(ValueError, match="chunk 1 links to"):
+            validate_chunk_chain(writer.manifest, str(tmp_path))

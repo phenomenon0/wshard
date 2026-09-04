@@ -668,3 +668,43 @@ func TestGoldenIdentityVerifies(t *testing.T) {
 		t.Skip("golden_hashes.json has no identity_* keys (regenerate)")
 	}
 }
+
+// TestVerifyIdentityAgainst pins the difference in kind between the two calls.
+// An attacker who rewrites a block also reseals meta/identity, so the file
+// re-verifies against itself happily: VerifyIdentity proves internal
+// consistency (no bit rot, no truncation) and nothing about origin. Only
+// comparing against a 64-hex obtained out of band detects the edit. An API
+// whose reachable call is the one that proves nothing is a footgun, so the
+// stronger call has its own name.
+func TestVerifyIdentityAgainst(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "a.wshard")
+	if err := CreateWShard(p, identityEpisode()); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := VerifyIdentity(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := VerifyIdentityAgainst(p, sealed); err != nil || got != sealed {
+		t.Fatalf("VerifyIdentityAgainst(matching) = %q, %v; want %q, nil", got, err, sealed)
+	}
+
+	// A different episode: internally consistent, but not that identity.
+	q := filepath.Join(dir, "b.wshard")
+	other := identityEpisode()
+	other.Observations["state"].Data[0] ^= 1
+	if err := CreateWShard(q, other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyIdentity(q); err != nil {
+		t.Fatalf("edited file must still self-verify, that is the point: %v", err)
+	}
+	if _, err := VerifyIdentityAgainst(q, sealed); err == nil {
+		t.Fatal("VerifyIdentityAgainst(wrong identity) = nil error; want mismatch")
+	}
+
+	if _, err := VerifyIdentityAgainst(p, "abc"); err == nil {
+		t.Fatal("VerifyIdentityAgainst(short expected) = nil error; want length error")
+	}
+}
