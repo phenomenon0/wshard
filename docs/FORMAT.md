@@ -75,7 +75,7 @@ The index starts at byte 64 and contains `entry_count` entries of exactly 48 byt
 | 0x18 | 8 | disk\_size | Size on disk, compressed (LE uint64) |
 | 0x20 | 8 | orig\_size | Uncompressed size (LE uint64) |
 | 0x28 | 4 | checksum | CRC32C of uncompressed data (LE uint32) |
-| 0x2C | 4 | reserved | Zeroed (includes content-type hint) |
+| 0x2C | 4 | reserved | LE uint32: low 16 bits = content type (0=unknown, 2=JSON), high 16 bits = tag bits |
 
 **Total: 48 bytes per entry.**
 
@@ -108,7 +108,7 @@ These are advisory naming conventions, not format-level constraints. The Python 
 
 | Prefix | Role | Examples |
 |--------|------|---------|
-| `meta/` | JSON metadata blobs | `meta/wshard`, `meta/episode`, `meta/channels` |
+| `meta/` | JSON metadata blobs | `meta/wshard`, `meta/episode`, `meta/channels`, `meta/identity`, `meta/provenance` |
 | `signal/` | Ground truth observations | `signal/rgb`, `signal/joint_pos` |
 | `action/` | Agent actions | `action/ctrl`, `action/gripper` |
 | `time/` | Timestamps | `time/ticks`, `time/timestamps_ns` |
@@ -166,7 +166,57 @@ Data blocks start at boundaries determined by the `alignment` field in the heade
 
 ---
 
-## 9. Cross-language byte parity
+## 9. Identity and provenance
+
+Two `meta/` blocks are not ordinary metadata — their bytes are hashed, so they
+have to be **canonical JSON** (glyph SPEC-CANON §1-§4: keys sorted by UTF-8
+bytes, no insignificant whitespace, RFC 8785 string escaping) and not merely
+valid JSON.
+
+`meta/identity` is written **last**, after every other block:
+
+```json
+{"entries":{"<block name>":"<sha256 hex of its uncompressed bytes>"},
+ "leaf":"sha256","v":1}
+```
+
+The file's identity is `sha256` of that block, 64 lowercase hex. Leaves are over
+*uncompressed* bytes, so the same episode written none / zstd / lz4 gives three
+different files, three different sets of CRC32Cs, and one identity.
+
+`meta/provenance` is optional and, when present, is written immediately **before**
+`meta/identity`, so the identity commits to it:
+
+```json
+{"end_state":"","epoch":7,"first_seq":10001,"last_seq":20000,
+ "prev_identity":"<64hex>","run_id":"…","source":{"git_commit":"…"},
+ "start_state":"<64hex>","v":1}
+```
+
+Every field is always written even when empty — an absent key and a key holding
+`""` are different canonical JSON, and so a different hash. `epoch`, `first_seq`
+and `last_seq` must stay within ±2^53, past which canonical JSON renders integers
+as floats; a writer that is handed a larger value errors instead of silently
+losing it. `prev_identity` is the identity of the preceding episode of the same
+run, which is what makes a sequence of chunks a chain rather than a set.
+
+CRC32C answers a different question from identity: it proves a block matches its
+own index slot, which anyone editing the file can recompute. The identity proves
+every block matches what the writer sealed.
+
+| | Python | Go | TypeScript |
+|---|---|---|---|
+| Read sealed identity | `episode_identity` | `EpisodeIdentity` | — |
+| Re-hash and check | `verify_identity` | `VerifyIdentity` | — |
+| Check against a known 64-hex | `verify_identity(p, expected=)` | `VerifyIdentityAgainst` | — |
+| Read provenance | `episode_provenance` | `EpisodeProvenance` | — |
+
+The third row is the one that detects an edit; the second only detects bit rot,
+because whoever rewrote a block also resealed `meta/identity`.
+
+---
+
+## 10. Cross-language byte parity
 
 Go is the reference implementation. Python and TypeScript produce byte-identical output for the same input. Verified by golden-file tests in `golden/`:
 
@@ -181,6 +231,6 @@ xxHash64("signal/obs")   = 0x86f8c8413116a0ae
 
 ---
 
-## 10. For more detail
+## 11. For more detail
 
 This document covers the layout well enough to write a reader. For the full byte-level spec — including the `meta/wshard` timebase object, multi-modal signal naming, chunked episode manifest format, the DeepData bridge, and cross-language interop bugs that were found and fixed — read [DEEP_DIVE.md](DEEP_DIVE.md).

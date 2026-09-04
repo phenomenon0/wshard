@@ -24,11 +24,11 @@ episode.wshard
 
 ```bash
 git clone https://github.com/phenomenon0/wshard
-cd wshard/py
-pip install -e ".[dev]"
+cd wshard
+pip install -e "./py[dev]"
 
-python ../examples/write_cartpole.py
-python ../examples/read_cartpole.py examples/cartpole.wshard
+python examples/write_cartpole.py
+python examples/read_cartpole.py
 wshard inspect examples/cartpole.wshard      # CLI: also `wshard verify`, `convert`, `export`, `doctor`
 ```
 
@@ -48,7 +48,10 @@ narrow gap:
 - **32-byte aligned data.** Read with `mmap()` + pointer cast for low-copy
   reads.
 - **CRC32C checksums.** Hardware-accelerated integrity per block.
-- **Streaming append.** `.partial` file pattern for crash-safe live recording.
+- **Streaming writer.** Record a live loop timestep by timestep and publish
+  once: `end_episode()` writes the episode, seals it, and renames `.partial`
+  into place. Nothing partial is ever visible — and nothing is durable before
+  that call. For incremental durability, write chunk files (see below).
 - **Cross-language.** Python, TypeScript, and Go readers/writers from one
   spec.
 
@@ -116,27 +119,37 @@ ep.actions["ctrl"] = Channel(
     name="ctrl", dtype=DType.FLOAT32,
     shape=[7], data=np.random.randn(100, 7).astype(np.float32),
 )
-ep.rewards = Channel(name="reward", dtype=DType.FLOAT32, data=np.zeros(100, dtype=np.float32))
+ep.rewards = Channel(
+    name="reward", dtype=DType.FLOAT32,
+    shape=[], data=np.zeros(100, dtype=np.float32),
+)
 save_wshard(ep, "episode.wshard", compression="zstd")
 ```
 
 ### Streaming (live recording)
 
 ```python
-from wshard.streaming import WShardStreamWriter
+from wshard.streaming import ChannelDef, WShardStreamWriter
+from wshard.types import DType
 
 channels = [
-    {"id": "joint_pos", "dtype": "f32", "shape": [7]},
-    {"id": "ctrl", "dtype": "f32", "shape": [7]},
+    ChannelDef("joint_pos", DType.FLOAT32, [7]),
+    ChannelDef("ctrl", DType.FLOAT32, [7]),
 ]
 
 with WShardStreamWriter("recording.wshard", "ep_001", channels) as w:
-    w.begin_episode()
+    w.begin_episode(env_id="ManipulationEnv-v2")
     for t in range(1000):
         obs, reward, done = env.step(action)
-        w.write_timestep({"joint_pos": obs, "ctrl": action}, reward=reward, done=done)
-    w.end_episode()  # atomic rename from .partial
+        w.write_timestep(t, {"joint_pos": obs}, {"ctrl": action}, reward, done)
+    w.end_episode()  # write, seal with meta/identity, rename off .partial
 ```
+
+`write_timestep` buffers; the file gets its bytes at `end_episode()`. The index
+describes each block as one extent, so a block can only be written once — which
+is why the writer keeps the episode in RAM (bounded by `max_timesteps`) and
+passing `flush_interval` is an error rather than a no-op. Episodes too long for
+memory want chunk files.
 
 ### TypeScript
 
@@ -188,9 +201,14 @@ ep, err := shard.OpenWShard("episode.wshard")
 
 ## Performance
 
-Go reads a T=1000 episode (~21 MB raw) in ~6 ms (3.7 GB/s, memory-bandwidth limited).
-Python reads in ~4 ms; writes in ~30 ms (no compression) or ~36 ms (zstd).
-Header + index lookup alone takes ~12 µs, enabling 80,000+ index scans per second.
+Go reads a T=1000 episode (~21 MB raw) in ~5 ms (4.1 GB/s, memory-bandwidth limited).
+Python reads in ~5.6 ms and writes in ~43 ms uncompressed; zstd costs ~165 ms to
+write and ~29 ms to read, for a 1.97× smaller file.
+Header + index lookup alone takes ~8 µs in Go, and 9.8 µs per file in Python
+measured across 1000 real episode files — 100,000+ index scans per second.
+
+Writes include sealing: the writer sha256s every block to build `meta/identity`,
+which is one extra pass over the payload (visible mostly on the uncompressed path).
 
 See [`bench/`](bench/) for write/read benchmarks across compression types vs NumPy NPZ.
 
@@ -207,7 +225,7 @@ Block names are hierarchical paths:
 
 | Prefix | Content |
 |--------|---------|
-| `meta/` | JSON metadata (`meta/wshard`, `meta/episode`, `meta/channels`, `meta/identity`) |
+| `meta/` | JSON metadata (`meta/wshard`, `meta/episode`, `meta/channels`, `meta/identity`, `meta/provenance`) |
 | `signal/` | Observation tensors |
 | `action/` | Action tensors |
 | `time/` | Timestamps (`time/ticks`, `time/timestamps_ns`) |
@@ -223,12 +241,34 @@ Compression: none, zstd, or lz4 — per block. Checksums: CRC32C (Castagnoli).
 
 Identity: `meta/identity` is written last and holds
 `{"entries":{"<block>":"<sha256 of the block's uncompressed bytes>",…},"leaf":"sha256","v":1}`
-as canonical JSON ([glyph SPEC-CANON §4](../glyph/SPEC-CANON.md)). The file's
+as canonical JSON (glyph SPEC-CANON §4). The file's
 identity is `sha256` of that block — `episode_identity(path)` in Python,
 `EpisodeIdentity(path)` in Go: identical across none/zstd/lz4 layouts, different
 for any content change. `verify_identity` / `VerifyIdentity` re-hash every block
 against it; CRC32C only proves a block matches its own index slot, which whoever
-edits the file can rewrite. The streaming writers do not write an identity yet.
+edits the file can rewrite. The streaming and chunked writers seal what they
+write the same way: `end_episode(provenance=…)` in Python, `SetProvenance`
+before `EndEpisode()` in Go.
+
+Provenance: `meta/provenance` is optional and says where an episode came from —
+
+```json
+{"v":1,"run_id":"…","epoch":7,"first_seq":10001,"last_seq":20000,
+ "start_state":"<64hex>","end_state":"<64hex>","prev_identity":"<64hex>",
+ "source":{"git_commit":"…","schema_fp":"…"}}
+```
+
+also canonical JSON, and written immediately *before* `meta/identity` so the
+identity commits to it: rewriting which run produced an episode breaks
+`verify_identity`, not just a checksum anyone could recompute. `prev_identity`
+is the `episode_identity` of the preceding episode of the same run, which makes
+a set of chunks a chain rather than a set — chunk N names the exact bytes of
+chunk N-1, so a missing or swapped chunk is detectable without trusting the
+manifest that lists them. Read it without decoding tensors via
+`episode_provenance(path)` in Python, `EpisodeProvenance(path)` in Go. Every
+field is always written, even when empty: an absent key and a key holding `""`
+are different canonical JSON, so omitting one would make two equal provenances
+hash differently across producers.
 
 See [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md) for the byte-level spec.
 
@@ -287,14 +327,21 @@ intentional — the goal is to find sharp edges before declaring 1.0.
 Split long episodes across multiple files:
 
 ```python
-from wshard.chunked import ChunkedEpisodeWriter, validate_chunk_continuity
+from wshard.chunked import (
+    ChunkedEpisodeWriter, validate_chunk_chain, validate_chunk_continuity,
+)
 
 writer = ChunkedEpisodeWriter("data/ep_001", "ep_001", chunk_size_t=1000)
-for chunk in episode_chunks:
-    writer.write_chunk(chunk)
-manifest = writer.finalize_manifest()
-validate_chunk_continuity(manifest)  # catches gaps, duplicates, discontinuities
+writer.write_episode_chunked(long_episode)   # slices and writes every chunk
+manifest_path = writer.finalize_manifest()   # returns the path it wrote
+
+validate_chunk_continuity(writer.manifest)            # gaps, duplicates, ranges
+validate_chunk_chain(writer.manifest, "data/ep_001")  # re-reads and re-links chunks
 ```
+
+`validate_chunk_continuity` reads only the manifest. `validate_chunk_chain` opens
+each chunk and follows its `prev_identity` back, so a swapped, edited, or missing
+chunk is caught even if the manifest was rewritten to match.
 
 ### Multi-modal observations
 
@@ -314,9 +361,14 @@ rgb_channels = get_multimodal_observations(ep, modality=Modality.RGB)
 ```python
 from wshard.residual import compute_sign2nd_diff, pack_residual_bits, unpack_residual_bits
 
-residual = compute_sign2nd_diff(signal)  # {-1, 0, +1} array
-packed = pack_residual_bits(residual)     # 2 bits per element
+residual = compute_sign2nd_diff(signal)   # 1-D signal -> {-1, 0, +1} array
+packed = pack_residual_bits(residual)     # 1 bit per element
 ```
+
+`compute_sign2nd_diff` takes a 1-D signal; use `compute_sign2nd_diff_multidim`
+for `[T, D]`. The bit packing is lossy on purpose: it keeps one bit per element,
+so `0` and `-1` both unpack as `-1`. Use it as a coarse side-channel, not as a
+reconstruction of the signal.
 
 ### Format conversion (experimental)
 
@@ -360,7 +412,8 @@ After `pip install`, the `wshard` script is on PATH:
 
 ```bash
 wshard inspect episode.wshard          # block list + dtype + shape + size
-wshard verify episode.wshard           # CRC32C check every block
+wshard verify episode.wshard           # CRC32C check every block (not meta/identity —
+                                       # use verify_identity / VerifyIdentity for that)
 wshard convert input.npz output.wshard # auto-detect (DreamerV3 NPZ today)
 wshard export episode.wshard --format dreamer
 wshard doctor                          # version + dependency check

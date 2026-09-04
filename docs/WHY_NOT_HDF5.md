@@ -38,20 +38,20 @@ All numbers from `bench/bench_python.py` and the partial-read benchmark in `benc
 
 | Config | Read median | Read min | File size | Ratio |
 |--------|-------------|----------|-----------|-------|
-| wshard-none | 4.3 ms | 4.1 ms | 20.25 MB | 1.00× |
-| wshard-zstd | 27.6 ms | 27.4 ms | 10.29 MB | 1.97× |
-| hdf5-deflate | 99.8 ms | 95.8 ms | 9.71 MB | 2.08× |
+| wshard-none | 5.6 ms | 5.5 ms | 20.25 MB | 1.00× |
+| wshard-zstd | 28.8 ms | 28.5 ms | 10.29 MB | 1.97× |
+| hdf5-deflate | 97.6 ms | 96.7 ms | 9.71 MB | 2.08× |
 
-WShard (uncompressed) reads **~23× faster** than HDF5-deflate on this workload. Even WShard-zstd, which achieves similar compression to HDF5-deflate, reads **3.6× faster** (27.6 ms vs 99.8 ms). The difference is mainly that WShard's index is at the front of the file (sequential read), each block decompresses independently, and there is no HDF5 B-tree traversal or metadata decode overhead.
+WShard (uncompressed) reads **~17× faster** than HDF5-deflate on this workload. Even WShard-zstd, which achieves similar compression to HDF5-deflate, reads **3.4× faster** (28.8 ms vs 97.6 ms). The difference is mainly that WShard's index is at the front of the file (sequential read), each block decompresses independently, and there is no HDF5 B-tree traversal or metadata decode overhead.
 
 ### Partial-block reads — fetching one channel from a large file
 
 | Format | File size | Median time | Min time |
 |--------|-----------|-------------|----------|
-| WShard (zstd) | 25.8 MB | 39 µs | 34 µs |
-| HDF5 (gzip-4) | 22.7 MB | 255 µs | 251 µs |
+| WShard (zstd) | 25.8 MB | 111 µs | 100 µs |
+| HDF5 (gzip-4) | 22.7 MB | 273 µs | 248 µs |
 
-WShard is **~6.5× faster** for partial-block reads. This is the workload most training loops actually run: fetch `action/ctrl` (28 KB) from an episode that also contains a 21 MB RGB block. WShard seeks directly to `action/ctrl` using the front-of-file index. HDF5 uses a B-tree index, but the metadata I/O and object-header overhead add up to ~6× more latency on this machine.
+WShard is **~2.5× faster** for partial-block reads. This is the workload most training loops actually run: fetch `action/ctrl` (28 KB) from an episode that also contains a 21 MB RGB block. WShard seeks directly to `action/ctrl` using the front-of-file index. HDF5 uses a B-tree index, but the metadata I/O and object-header overhead add up to ~2.5× more latency on this machine.
 
 Both benchmarks: AMD Ryzen 7 7700X, Fedora 43, Python 3.14, h5py 3.x, pyarrow 22.0.0. Reproduce on your hardware before making decisions.
 
@@ -61,13 +61,28 @@ Both benchmarks: AMD Ryzen 7 7700X, Fedora 43, Python 3.14, h5py 3.x, pyarrow 22
 
 **Tiny spec.** The complete binary format is documented in a few hundred lines. Anyone can implement a reader in any language without a shared C library. TypeScript runs in the browser, no native dependencies.
 
-**Streaming append with crash safety.** WShard's `.partial` file pattern means a robot process that crashes mid-episode leaves the previous file intact. HDF5 in streaming mode is risky without explicit journaling.
+**Publish-once writes.** `WShardStreamWriter` records a live loop timestep by
+timestep, then writes, seals, `fsync`s, and renames `.partial` → `episode.wshard`
+in one step at `end_episode()`. A crash mid-episode loses that episode and leaves
+every previous file untouched — there is no half-written `.wshard` to detect.
+That is also the limit: nothing is durable before the final call, so long runs
+should be written as chunk files. HDF5 in streaming mode is risky without
+explicit journaling, but it does give you data on disk as you go.
 
-**Per-block compression, not per-dataset.** You can zstd one block and leave another uncompressed within the same file, controlled per block at write time.
+**Content identity that survives recompression.** `meta/identity` is a sha256
+over each block's *uncompressed* bytes, so the same episode written none / zstd /
+lz4 gives three different files and one identity. HDF5 has no format-level
+equivalent; a checksum filter covers stored (compressed) chunks.
+
+**Per-block compression flags.** Every index entry carries its own codec bits, so
+a file can mix codecs. The shipped writers take one codec per file and decide per
+block only whether to apply it (skipped under 64 bytes, or when the compressed
+form is not smaller) — mixing codecs is a container capability with no API in
+front of it yet. HDF5 exposes per-dataset filters today.
 
 **No minimum file overhead.** The 64-byte header scales to tiny files (T=10, sub-kilobyte episodes) without the ~99 KB HDF5 superblock cost.
 
-**64-byte header fits in one disk sector.** The header is always parseable with a single aligned read. For latency-sensitive index enumeration (65,000+ episodes/second from local disk), this matters.
+**64-byte header fits in one disk sector.** The header is always parseable with a single aligned read. For latency-sensitive index enumeration (100,000+ episodes/second from local disk — 9.8 µs per file measured over 1000 real files in Python), this matters.
 
 ---
 

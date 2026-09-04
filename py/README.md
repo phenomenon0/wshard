@@ -21,7 +21,10 @@ ep.actions["ctrl"] = Channel(
     name="ctrl", dtype=DType.INT32, shape=[1],
     data=np.zeros((100, 1), dtype=np.int32),
 )
-ep.rewards = Channel(name="reward", dtype=DType.FLOAT32, data=np.ones(100, dtype=np.float32))
+ep.rewards = Channel(
+    name="reward", dtype=DType.FLOAT32,
+    shape=[], data=np.ones(100, dtype=np.float32),
+)
 
 save_wshard(ep, "episode.wshard")
 loaded = load_wshard("episode.wshard")
@@ -38,11 +41,15 @@ pip install "git+https://github.com/phenomenon0/wshard.git#subdirectory=py"
 
 ## Optional extras
 
+`wshard` is not on PyPI yet, so extras go on the git URL:
+
 ```bash
-pip install "wshard[bf16]"    # ml_dtypes for bfloat16 channels
-pip install "wshard[hdf5]"    # h5py for HDF5 import bridge
-pip install "wshard[torch]"   # PyTorch tensor adapters
-pip install "wshard[dev]"     # pytest, build tools
+GIT="git+https://github.com/phenomenon0/wshard.git#subdirectory=py"
+
+pip install "wshard[bf16] @ $GIT"    # ml_dtypes for bfloat16 channels
+pip install "wshard[hdf5] @ $GIT"    # h5py for HDF5 import bridge
+pip install "wshard[torch] @ $GIT"   # PyTorch tensor adapters
+pip install "wshard[dev] @ $GIT"     # pytest, build tools
 ```
 
 ## Status

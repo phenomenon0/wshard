@@ -28,13 +28,13 @@ format for one specific shape of problem.
 
 | Capability | Status |
 |---|---|
-| Python reader / writer | beta, 139 tests passing |
+| Python reader / writer | beta, 162 tests passing (7 skipped) |
 | TypeScript reader / writer | beta, 15 tests passing |
 | Go reader / writer | beta, full test coverage |
 | Cross-language byte-parity | verified by golden-file CI |
 | Per-block compression (none / zstd / lz4) | yes |
 | CRC32C integrity per block | yes |
-| Streaming append (`.partial` → atomic rename) | yes |
+| Live recording, published atomically (`.partial` → rename) | yes |
 | Chunked episodes with continuity validation | yes |
 | Single-channel partial reads | yes — `load_wshard(path, channels=[…])` |
 | Multi-modal observation lanes (RGB / depth / proprio / language) | yes |
@@ -59,28 +59,32 @@ warm cache where noted.
 
 | Format          | Read time |
 |-----------------|-----------|
-| WShard (no compression) | ~6 ms (Go) / ~4 ms (Python) |
-| WShard (zstd)           | ~28 ms (Python) |
-| HDF5 (deflate)          | ~100 ms (Python) |
-| NumPy NPZ (deflate)     | ~94 ms (Python) |
-| Parquet (LeRobot-style) | ~67 ms (Python) |
+| WShard (no compression) | ~5 ms (Go) / ~5.6 ms (Python) |
+| WShard (zstd)           | ~29 ms (Python) |
+| HDF5 (deflate)          | ~98 ms (Python) |
+| NumPy NPZ (deflate)     | ~39 ms (Python) |
+| Parquet (zstd, LeRobot-style) | ~14 ms (Python) |
 
 **Single-channel partial fetch** (one 28 KB action block from a 50 MB file,
 public API only, no internal helpers):
 
 | Format            | Median time |
 |-------------------|-------------|
-| **WShard (zstd)** | **101 µs** |
-| NPZ (deflate)     | 194 µs |
-| HDF5 (gzip-4)     | 255 µs |
+| **WShard (zstd)** | **111 µs** |
+| NPZ (deflate)     | 175 µs |
+| HDF5 (gzip-4)     | 273 µs |
 
-**Streaming append**: per-step write cost is ~25 µs. Crash-safe by virtue of
-the `.partial` file pattern — episodes either finalize via atomic rename or
-remain visibly unfinished.
+**Live recording**: per-step cost is ~24 µs, comfortably inside a 1 kHz control
+loop. The writer buffers the episode and publishes it in one step at
+`end_episode()` — write, seal, `fsync`, rename `.partial` → `episode.wshard`. A
+crash before that call loses the episode rather than leaving a half-written one,
+which is a deliberate trade: the index gives each block exactly one extent, so a
+block is written once. For runs that must survive a crash, write chunk files —
+each is a complete sealed episode, chained by `prev_identity`.
 
 We are not claiming WShard is fastest at everything. We are claiming it is
 fast at the things you do most when iterating on RL or world-model training:
-seek to one block, read a whole episode end-to-end, append timesteps live.
+seek to one block, read a whole episode end-to-end, record a loop live.
 
 ---
 
@@ -114,8 +118,10 @@ below already exist or are in progress.
 
 - **Header**: magic (`SHRD`), version, role (`0x05` = WShard), alignment,
   default compression, entry count, offsets.
-- **Index entry (48 B)**: name offset/length, xxHash64 of name, data offset,
-  on-disk size, original size, dtype, shape rank, flags, CRC32C.
+- **Index entry (48 B)**: xxHash64 of name, name offset/length, flags, data
+  offset, on-disk size, original size, CRC32C, and a reserved word carrying the
+  content-type hint. Dtype and shape live in the `meta/channels` JSON block, not
+  the index.
 - **Block names** are hierarchical paths:
   - `meta/wshard`, `meta/episode`, `meta/channels` — JSON metadata
   - `signal/<id>` — observation tensors

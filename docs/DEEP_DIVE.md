@@ -51,13 +51,13 @@ Each named block is independently addressable. A training loop that only needs `
 
 | Component | Language | Lines | Status |
 |-----------|----------|-------|--------|
-| `wshard` Python package | Python | ~4,000 | Beta |
-| `@wshard/core` npm package | TypeScript | ~3,500 | Beta |
-| `shard` Go package | Go | ~2,000 | Beta |
-| Golden test fixtures | Go generator | 553 | Verified |
+| `wshard` Python package | Python | ~5,900 | Beta |
+| `@wshard/core` npm package | TypeScript | ~3,300 | Beta |
+| `shard` Go package | Go | ~6,100 | Beta |
+| Golden test fixtures | Go generator | 831 | Verified |
 | DeepData trajectory bridge | Python | ~500 | Experimental |
 
-Python: 103 tests, TypeScript: 15 tests, all passing locally. The cross-language conformance matrix runs in CI. Beta means the API and on-disk format are stable enough to try; we are looking for external users to surface real-world breakage before declaring 1.0.
+Python: 162 tests (7 skipped), Go: 156 tests, TypeScript: 15 tests, all passing locally. The cross-language conformance matrix runs in CI. Beta means the API and on-disk format are stable enough to try; we are looking for external users to surface real-world breakage before declaring 1.0.
 
 ---
 
@@ -108,8 +108,9 @@ Offset    Size    Field
 0x18      8       Disk size (compressed, LE)
 0x20      8       Original size (uncompressed, LE)
 0x28      4       CRC32C checksum (of uncompressed data)
-0x2C      2       Content type (0=raw, 2=JSON)
-0x2E      2       Reserved
+0x2C      4       Reserved (LE uint32):
+                    low  16 bits — content type (0=unknown, 2=JSON)
+                    high 16 bits — tag bits
 ```
 
 ### Why This Matters
@@ -122,13 +123,44 @@ Offset    Size    Field
 
 **Checksums.** CRC32C (Castagnoli polynomial `0x82F63B78`) on uncompressed data. This is the hardware-accelerated CRC on x86 (`_mm_crc32_*`) and ARM (`__crc32c*`). Go's `crc32.Castagnoli`, Python's `crc32c` package, and the TypeScript implementation all use this polynomial.
 
+**Identity.** CRC32C answers "did this block survive the disk?" — not "is this the
+episode I was given." Whoever rewrites a block can recompute its CRC32C in the
+same pass. So the writer seals the file with one more block, written last:
+
+```
+meta/identity → {"entries":{"<block>":"<sha256 of its uncompressed bytes>",…},
+                 "leaf":"sha256","v":1}
+```
+
+as canonical JSON (glyph SPEC-CANON §4), which makes `sha256` of that block the
+episode's identity — 64 lowercase hex. Hashing *uncompressed* bytes is what makes
+the identity survive re-compression: the same episode written none, zstd, and lz4
+has three different files, three different sets of CRC32Cs, and one identity.
+
+| Call | Python | Go |
+|---|---|---|
+| Read the sealed identity | `episode_identity(path)` | `EpisodeIdentity(path)` |
+| Re-hash every block against it | `verify_identity(path)` | `VerifyIdentity(path)` |
+
+`meta/provenance`, when present, is written immediately *before* `meta/identity`,
+so the identity commits to it. It holds `run_id`, `epoch`, `first_seq`,
+`last_seq`, `start_state`, `end_state`, `prev_identity`, and a free-form `source`
+map — also canonical JSON, every field always written, because an absent key and
+a key holding `""` are different bytes and so a different hash. `prev_identity`
+is the identity of the previous episode of the same run: chunk N names the exact
+bytes of chunk N-1, which is what makes a set of chunks a chain. Read it without
+decoding tensors via `episode_provenance(path)` / `EpisodeProvenance(path)`.
+
+Both blocks ship in Python and Go. The TypeScript reader parses the file
+normally but does not compute or check identity yet.
+
 ### Block Naming Convention
 
 Names are hierarchical paths separated by `/`:
 
 | Prefix | Purpose | Examples |
 |--------|---------|----------|
-| `meta/` | JSON metadata | `meta/wshard`, `meta/episode`, `meta/channels` |
+| `meta/` | JSON metadata | `meta/wshard`, `meta/episode`, `meta/channels`, `meta/identity`, `meta/provenance` |
 | `signal/` | Ground truth observations | `signal/rgb`, `signal/joint_pos` |
 | `action/` | Agent actions | `action/ctrl`, `action/gripper` |
 | `omen/` | Model predictions | `omen/joint_pos/dreamer` |
@@ -231,33 +263,68 @@ The bet is that episode-shaped data — observations, actions, rewards, plus mod
 
 **1. Per-block compression in a flat binary.**
 
-An episode with 5 camera streams and 20 scalar channels shouldn't compress everything the same way. WShard lets you zstd the video at level 19 and leave the 40-byte reward vector uncompressed. Each block carries its own compression flag — the reader auto-detects from the index entry bits.
+An episode with 5 camera streams and 20 scalar channels shouldn't compress everything the same way. Each block carries its own compression flag in its index entry, so the reader auto-detects per block — no header-level assumption.
+
+What the shipped writers expose is one codec per file plus an automatic per-block
+skip: a block under 64 bytes is stored raw, and a block whose compressed form is
+not smaller is stored raw. So the 40-byte reward vector stays uncompressed in a
+zstd file without being asked to.
 
 ```python
-# Write with per-block compression control
-writer = WShardStreamWriter(path, "ep_001", channels=[
-    {"id": "rgb", "dtype": "u8", "shape": [84, 84, 3], "compression": "zstd"},
-    {"id": "joint", "dtype": "f32", "shape": [7]},  # no compression needed
-])
+from wshard import save_wshard
+from wshard.compress import CompressionLevel, CompressionType
+
+save_wshard(ep, "episode.wshard", CompressionType.ZSTD, CompressionLevel.BEST)
 ```
 
-**2. Streaming append with crash safety.**
+A per-channel codec choice is a format capability with no API in front of it yet:
+nothing in the container stops a writer from putting zstd on `signal/rgb` and lz4
+on `signal/depth`, but no shipped writer will do it for you.
 
-Robot data collection runs for hours. If the process crashes at minute 47, you lose everything with HDF5 (corrupted file). WShard's streaming writer uses a reserve-write-finalize pattern:
+**2. A streaming writer that never publishes a half-file.**
 
-1. Write to `episode.wshard.partial`
-2. Reserve space for the header (rewritten at finalization)
-3. Append timesteps incrementally
-4. On success: atomic `rename()` to `episode.wshard`
-5. On crash: `.partial` file is deleted or identifiable as incomplete
+WShard's streaming writer uses a reserve-buffer-finalize pattern:
+
+1. `begin_episode()` opens `episode.wshard.partial` and reserves header + index space
+2. `write_timestep()` validates the step against the channel defs and appends it
+   to a per-block buffer in memory
+3. `end_episode()` writes every buffer once, writes the metadata blocks, seals the
+   file with `meta/identity`, seeks back for the real header and index, `fsync`s,
+   and atomically `rename()`s to `episode.wshard`
+4. On crash: no `episode.wshard` exists, and the orphan `.partial` is by name not
+   a readable episode
 
 ```python
+from wshard.streaming import ChannelDef, WShardStreamWriter
+from wshard.types import DType
+
+channels = [ChannelDef("state", DType.FLOAT32, [4]),
+            ChannelDef("ctrl", DType.FLOAT32, [2])]
+
 with WShardStreamWriter(path, "ep_001", channels) as w:
-    w.begin_episode()
+    w.begin_episode(env_id="CartPole-v1")
     for t in range(T):
-        w.write_timestep({"state": obs, "ctrl": act}, reward=r, done=d)
-    w.end_episode()  # atomic finalize
+        w.write_timestep(t, {"state": obs}, {"ctrl": act}, reward, done)
+    w.end_episode()   # write, seal, fsync, rename
 ```
+
+**What this does not give you is incremental durability.** Nothing reaches the
+file before `end_episode()`, so a crash at minute 47 of a one-hour episode loses
+all 47 minutes — it just loses them cleanly, with no corrupt file left behind.
+The reason is the index: every block is described by exactly one
+`(offset, size)` extent, so a block can be written exactly once. Flushing twice
+would interleave the channels on disk while each extent grew over its
+neighbours' bytes — the byte count would still come out right, T would infer,
+the reshape would succeed and CRC32C would pass, and the values would be another
+channel's. All three writers therefore flush only at the end, and all three
+reject a flush-interval argument rather than accepting it and doing nothing
+(`flush_interval`, `WithFlushInterval`, `flushInterval`). The TypeScript writer
+did flush on a 64-timestep interval and produced exactly the corruption above
+for any episode longer than that; it now matches Go and Python.
+
+For hours-long collection that must survive a crash, write chunk files: each
+chunk is a complete sealed episode on disk, and `prev_identity` links them
+(next section).
 
 **3. Cross-language without serialization overhead.**
 
@@ -274,16 +341,35 @@ All three implementations agree on CRC32C checksums (`0x9a71bb4c` for "hello"), 
 A 10-minute manipulation episode at 30Hz with 3 cameras is ~2GB. You don't want that as a single file on a networked filesystem. WShard splits episodes into chunks with a manifest shard that tracks continuity:
 
 ```python
-writer = ChunkedEpisodeWriter("data/ep_001", "ep_001", chunk_size_t=1000)
-for chunk in chunks:
-    writer.write_chunk(chunk)
-manifest = writer.finalize_manifest()
+from wshard.chunked import (
+    ChunkedEpisodeWriter, validate_chunk_chain, validate_chunk_continuity,
+)
 
-# Validation catches gaps, duplicates, and discontinuities
-validate_chunk_continuity(manifest)
+writer = ChunkedEpisodeWriter("data/ep_001", "ep_001", chunk_size_t=1000)
+writer.write_episode_chunked(long_episode)   # slices and writes every chunk
+manifest_path = writer.finalize_manifest()   # returns the path it wrote
+
+validate_chunk_continuity(writer.manifest)            # gaps, duplicates, discontinuities
+validate_chunk_chain(writer.manifest, "data/ep_001")  # re-reads and re-links the chunks
 ```
 
-Each chunk is a standalone `.wshard` file with `chunk_index`, `total_chunks`, and `timestep_range` in its metadata. The manifest shard (role=0x04) ties them together.
+Each chunk is a standalone `.wshard` file with `chunk_index` and `timestep_range`
+in its metadata, plus `total_chunks` when the writer knows it. The manifest shard
+(role=0x04) ties them together.
+
+To feed chunks in as they arrive instead, call `write_chunk(slice)` per slice.
+Those chunks carry no `total_chunks`: the writer only learns the total at
+`finalize_manifest()`, and it cannot be patched into a chunk afterwards because
+it lives in `meta/episode`, which `meta/identity` commits to. The manifest is
+where the total is recorded, and `validate_chunk_continuity` is what checks the
+set is complete.
+
+The two validators check different things. `validate_chunk_continuity` reads only
+the manifest: it catches gaps, duplicate indices, and timestep ranges that do not
+join up. `validate_chunk_chain` opens the chunk files and follows each one's
+`prev_identity` back to the identity of the chunk before it, so an edited,
+swapped, or missing chunk is caught even when the manifest was rewritten to
+agree with it.
 
 **5. Semantic lanes for model training.**
 
@@ -321,7 +407,7 @@ These are exactly the bugs that unit tests don't catch. Each implementation pass
 
 ### How We Fixed It
 
-**Golden file testing.** A standalone Go program (`golden/generate.go`) writes three `.wshard` files using the authoritative Go shard implementation:
+**Golden file testing.** A standalone Go program (`golden/generate.go`) writes six `.wshard` files using the authoritative Go shard implementation:
 
 | File | Purpose |
 |------|---------|
@@ -339,6 +425,9 @@ Python and TypeScript tests read these files and assert:
 - Episode metadata (id, env_id, length) parses correctly
 - Tensor shapes and values are correct
 - Compressed blocks decompress correctly
+- `meta/identity` in every golden file is re-derived by Python `verify_identity`
+  and Go `VerifyIdentity`, and matched against `identity_<file>` in
+  `golden_hashes.json`
 
 ```python
 # From test_interop.py — golden file parity test

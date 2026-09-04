@@ -37,14 +37,14 @@ WShard stores tensors verbatim. A `signal/rgb` block with shape `[T, 84, 84, 3]`
 
 | Config | Write median | Read median | File size |
 |--------|-------------|-------------|-----------|
-| wshard-none | 32.3 ms | **5.6 ms** | 20.25 MB |
-| wshard-zstd | 64.0 ms | **4.9 ms** | 20.24 MB |
-| parquet-zstd | 26.0 ms | 13.1 ms | 20.25 MB |
-| parquet-none | 10.7 ms | 10.2 ms | 20.25 MB |
+| wshard-none | 43.1 ms | **6.0 ms** | 20.25 MB |
+| wshard-zstd | 75.4 ms | **5.7 ms** | 20.24 MB |
+| parquet-zstd | 27.8 ms | 13.8 ms | 20.25 MB |
+| parquet-none | 11.8 ms | 12.1 ms | 20.25 MB |
 
-WShard reads **2.4× faster** than Parquet on the same payload (5.6 ms vs 13.1 ms, wshard-none vs parquet-zstd). The difference is Parquet's column materialization: pyarrow constructs Python lists per column before you get an array. WShard uses `np.frombuffer` directly into the mmap'd block.
+WShard reads **2.3× faster** than Parquet on the same payload (6.0 ms vs 13.8 ms, wshard-none vs parquet-zstd). The difference is Parquet's column materialization: pyarrow constructs Python lists per column before you get an array. WShard uses `np.frombuffer` directly into the mmap'd block.
 
-Parquet write is faster (10.7 ms vs 32 ms for wshard-none) because pyarrow's column-write path is highly optimized C++, while WShard's Python writer is pure struct-packing today.
+Parquet write is faster (11.8 ms vs 43 ms for wshard-none) because pyarrow's column-write path is highly optimized C++, while WShard's Python writer is pure struct-packing plus one sha256 pass over the payload to seal the file with `meta/identity`.
 
 ---
 
@@ -52,7 +52,9 @@ Parquet write is faster (10.7 ms vs 32 ms for wshard-none) because pyarrow's col
 
 WShard and LeRobot can coexist in the same pipeline:
 
-- **Data collection:** write `.wshard` files per episode (streaming, crash-safe, from Go or Python)
+- **Data collection:** record live with `WShardStreamWriter` from Go or Python — one
+  file per episode, published atomically at `end_episode()`, or as chunk files for
+  runs long enough that losing the tail to a crash would hurt
 - **Training-time access:** read `.wshard` files directly from the DataLoader
 - **Publication:** convert to LeRobot format for hub upload
 

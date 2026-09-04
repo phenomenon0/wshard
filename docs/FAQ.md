@@ -12,7 +12,7 @@ See the "What WShard is not" table in [README.md](../README.md) for a quick deci
 
 ## Should I migrate from HDF5 / NPZ / Parquet?
 
-Probably not, unless you specifically need named tensor blocks per episode file, streaming-append crash safety, or cross-language access (Go + Python + TypeScript) with no code-generation step. If HDF5 is working for you today, the migration cost isn't worth it. If NPZ is fine, keep using it.
+Probably not, unless you specifically need named tensor blocks per episode file, an episode identity that survives recompression, or cross-language access (Go + Python + TypeScript) with no code-generation step. If HDF5 is working for you today, the migration cost isn't worth it. If NPZ is fine, keep using it.
 
 Where WShard tends to help: collecting data live from robots (streaming writer), running training pipelines across multiple languages, or storing model predictions alongside ground truth in the same file.
 
@@ -52,20 +52,67 @@ In practice you will never reach those limits in a single episode. A file is a s
 
 No. Camera data is stored as raw tensor blocks (`signal/rgb`, shape `[T, H, W, 3]`). H.264, H.265, and AV1 block types are listed as future work; the per-block architecture supports adding them (as new content type values), but no codec is implemented today.
 
-For now, the recommended pattern for camera-heavy pipelines is an external MP4 sidecar: write the video separately, reference the file path in `meta/episode`, and store only the decoded frames (or a downsampled version) inside the `.wshard` file if you need in-file access.
+For now, the recommended pattern for camera-heavy pipelines is an external MP4
+sidecar: write the video separately and store only the decoded frames (or a
+downsampled version) inside the `.wshard` file if you need in-file access.
+
+**Keep the sidecar under the seal.** A path alone breaks the format's main
+claim — the file is no longer self-contained and its identity says nothing about
+the video. Put the video's own sha256 in `provenance.source`, which is a
+free-form string map written to `meta/provenance`, which `meta/identity` commits
+to. The seal then reaches the video transitively: file identity → `meta/provenance`
+→ video sha256 → video bytes. Change one frame and the episode identity moves.
+
+```python
+import hashlib, pathlib
+from wshard.types import Provenance
+
+video = pathlib.Path("cam.mp4")
+video.write_bytes(encoded_h264)   # whatever your encoder produced
+ep.provenance = Provenance(
+    run_id="run-42",
+    source={"video_path": video.name,
+            "video_sha256": hashlib.sha256(video.read_bytes()).hexdigest()},
+)
+save_wshard(ep, "episode.wshard")
+```
+
+Two files still have to travel together, which is a real cost against the
+one-file pitch — but "self-contained" as a *property* survives even when
+self-contained as a *file layout* does not. Note that `Episode.metadata` is
+**not** the place for this: it is not written to the file and does not affect
+the identity.
 
 ---
 
 ## Can I stream / append to a file mid-episode?
 
-Yes. `WShardStreamWriter` uses a `.partial` file pattern for crash-safe live recording:
+You can feed a file timestep by timestep. You cannot read back a partially
+written one. `WShardStreamWriter` is a live-recording writer, not an append log:
 
-1. Open `episode.wshard.partial`
-2. Append timesteps one at a time with `write_timestep()`
-3. On success, call `end_episode()` — this writes the index and atomically renames to `episode.wshard`
-4. If the process crashes, the `.partial` file is left on disk and identifiable as incomplete; the main file is never touched
+1. `begin_episode()` opens `episode.wshard.partial` and reserves header + index space
+2. `write_timestep()` validates the step and buffers it in memory
+3. `end_episode()` writes every buffer, seals the file with `meta/identity`, writes
+   the real header and index, `fsync`s, and atomically renames to `episode.wshard`
+4. If the process crashes first, no `episode.wshard` exists and the orphan
+   `.partial` is by name not a readable episode
 
-From the streaming benchmark (`bench/bench_streaming.py`, T=10,000 episode): **24.7 µs per step** median. That is safe for 1 kHz robot control loops (40× headroom).
+So a crash loses the whole episode, cleanly, rather than leaving a corrupt file.
+Nothing is durable before `end_episode()`. The constraint is the index: each
+block is one `(offset, size)` extent, so a block can be written exactly once —
+flushing twice would interleave the channels on disk while each extent grew over
+its neighbours' bytes, and the result would pass CRC32C while holding another
+channel's values. All three writers flush only at the end, and all three reject
+a flush-interval argument rather than accepting one that does nothing.
+
+For collection runs that must survive a crash, write chunk files: each chunk is a
+complete sealed episode, and `prev_identity` links chunk N to the exact bytes of
+chunk N-1 (`ChunkedEpisodeWriter`, `validate_chunk_chain`).
+
+From the streaming benchmark (`bench/bench_streaming.py`, T=10,000 episode):
+**24.0 µs per step** median, 1.08 MiB peak RSS. That is safe for 1 kHz robot
+control loops (40× headroom); the memory is the whole episode, bounded by
+`max_timesteps`.
 
 ---
 
@@ -87,7 +134,31 @@ To validate a whole file without reading all block data into memory:
 wshard verify path/to/episode.wshard
 ```
 
-Note: CRC32C is an integrity check, not authentication. It detects accidental corruption (bit rot, truncation, partial writes). For files from untrusted sources, wrap the file in a signed envelope (e.g., a detached signature over the file hash) before relying on it.
+`wshard verify` checks CRC32C only. CRC32C detects accidental corruption (bit
+rot, truncation, partial writes) and nothing else: whoever rewrites a block can
+recompute its checksum in the same pass, so it does not detect editing.
+
+For that, use the identity. `meta/identity` holds a sha256 of every other block's
+uncompressed bytes, and `verify_identity(path)` (Python) / `VerifyIdentity(path)`
+(Go) re-hash the file against it and name the first block that differs. The
+identity itself is `sha256` of that block — 64 hex characters, unchanged by
+recompression, different for any content change.
+
+Which question you asked depends on whether you pass the expected value:
+
+```python
+verify_identity(path)                          # internally consistent? (bit rot, truncation)
+verify_identity(path, expected=known_64_hex)   # and is it the file that identity names?
+```
+```go
+VerifyIdentity(path)                       // same two calls in Go
+VerifyIdentityAgainst(path, known64Hex)
+```
+
+A recipient who knows the expected identity out of band detects an edited file;
+a recipient who does not still only knows the file is self-consistent. It is a
+fingerprint, not a signature — for files from untrusted sources, sign the
+identity.
 
 ---
 
@@ -95,9 +166,13 @@ Note: CRC32C is an integrity check, not authentication. It detects accidental co
 
 Yes, verified. Go is the reference implementation. Python and TypeScript read the same binary files and assert byte-level correctness via golden-file tests:
 
-- Reference files are in `golden/` (`simple_episode.wshard`, `dtype_zoo.wshard`, `per_block_compressed.wshard`, etc.)
+- Reference files are in `golden/` (`simple_episode.wshard`, `dtype_zoo.wshard`, `per_block_compressed.wshard`, `omen_uncert.wshard`, `multimodal.wshard`, `latent_action.wshard`)
 - Reference hash values are committed in `golden/golden_hashes.json`
 - CI verifies these on every push
+
+Identity is Go + Python. Every golden file's `meta/identity` is re-derived by
+both and matched against `identity_<file>` in the same JSON. The TypeScript
+reader parses these files but does not compute identity yet.
 
 Reference values:
 ```
@@ -131,9 +206,9 @@ They all use the same underlying **Shard** binary container (magic `SHRD`, v2 he
 
 Parquet has no native multi-dimensional array type. Tensor data must be either serialized to bytes (opaque blob per row) or exploded into flat scalar columns — both are awkward for training loops that want `np.frombuffer` directly into an aligned array.
 
-From the Parquet benchmark (`bench/bench_parquet.py`, same 20 MB workload, pyarrow 22.0.0): **WShard reads 2.4× faster** than Parquet on the same payload (wshard-none: 5.6 ms, parquet-zstd: 13.1 ms). Parquet write is faster (10.7 ms vs 32 ms for wshard-none) because pyarrow's column-write path is optimized C++, while WShard's Python writer is pure struct-packing today.
+From the Parquet benchmark (`bench/bench_parquet.py`, same 20 MB workload, pyarrow 22.0.0): **WShard reads 2.3× faster** than Parquet on the same payload (wshard-none: 6.0 ms, parquet-zstd: 13.8 ms). Parquet write is faster (11.8 ms vs 43 ms for wshard-none) because pyarrow's column-write path is optimized C++, while WShard's Python writer is pure struct-packing plus one sha256 pass to seal the file.
 
-Also, Parquet is row-group-oriented. For accessing one block out of a large file, WShard's flat index wins: `BenchmarkPartialReadCtrl` reads a 28 KB block from a 50 MB file in **~20 µs** (Go).
+Also, Parquet is row-group-oriented. For accessing one block out of a large file, WShard's flat index wins: `BenchmarkPartialReadCtrl` reads a 28 KB block from a 50 MB file in **~12 µs** (Go).
 
 ---
 
@@ -141,7 +216,7 @@ Also, Parquet is row-group-oriented. For accessing one block out of a large file
 
 See [WHY_NOT_HDF5.md](WHY_NOT_HDF5.md) for the full comparison.
 
-Short version: HDF5 is a better choice for scientific data with compound types, virtual datasets, or parallel MPI writes. WShard is a simpler answer for episode files where you need streaming-append crash safety, a tiny self-contained spec, and cross-language readers without a libhdf5 dependency.
+Short version: HDF5 is a better choice for scientific data with compound types, virtual datasets, or parallel MPI writes. WShard is a simpler answer for episode files where you need a tiny self-contained spec, a content identity that survives recompression, and cross-language readers without a libhdf5 dependency.
 
 ---
 
@@ -156,7 +231,7 @@ Open a GitHub issue. For security issues, follow [SECURITY.md](../SECURITY.md). 
 These are open questions, not planned features:
 
 1. **Video block type.** Native H.264/H.265/AV1 blocks would significantly reduce storage for camera-heavy episodes. The architecture supports it (new content type constant, codec implementation), but it is not prioritized until there is concrete user demand.
-2. **Compression-tuning UI.** Today you pick `none`, `zstd`, or `lz4` per block. Tuning the level (e.g., zstd level 3 vs level 19) requires direct API access; there is no declarative per-channel compression config in the metadata schema.
+2. **Per-channel compression.** The format stores a compression flag per block, but the shipped writers take one codec for the whole file and decide per block only whether to apply it (skipped under 64 bytes, or when the compressed form is not smaller). Choosing zstd for `signal/rgb` and none for `signal/depth` in one file is possible in the container and has no API in front of it. Level is `CompressionLevel.FASTEST` / `DEFAULT` / `BEST`, per file, not per channel.
 3. **Batch-shard format.** A multi-episode container (many `.wshard` episodes in one file) would help with dataset distribution. The ColumnShard role exists in the Shard family but is not part of this repo.
 4. **Arrow / Polars / DuckDB bridge.** An Arrow reader that exposes wshard channels as Arrow arrays would enable zero-copy interop with the columnar analytics ecosystem. Architecturally straightforward, not yet implemented.
 5. **Schema registry.** Block-name conventions are advisory. A formal schema definition (think: episode "type" declarations, required fields, expected dtypes) would enable validation and code generation, at the cost of flexibility.

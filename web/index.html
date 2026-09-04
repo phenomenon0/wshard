@@ -262,7 +262,7 @@ narrow gap:
 - **Fast name lookup.** Index entries carry an xxHash64 of the block name, so finding `signal/joint_pos` is a quick scan over fixed-size index slots, no string-table parse, no full deserialization.
 - **32-byte aligned data.** Read with `mmap()` + pointer cast for low-copy reads.
 - **CRC32C checksums.** Hardware-accelerated integrity per block.
-- **Streaming append.** `.partial` file pattern for crash-safe live recording.
+- **Streaming writer.** Record a live loop timestep by timestep; `end_episode()` writes, seals, and renames `.partial` into place. Nothing partial is ever visible — and nothing is durable before that call.
 - **Cross-language.** Python, TypeScript, and Go readers/writers from one spec.
 
 ## What WShard is not
@@ -398,12 +398,13 @@ ep, err := shard.OpenWShard("episode.wshard")
 
 ## Performance
 
-Go reads a T=1000 episode (~21 MB raw) in ~6 ms (3.7 GB/s, memory-bandwidth limited).
-Python reads in ~4 ms; writes in ~30 ms (no compression) or ~36 ms (zstd).
-Header + index lookup alone takes ~12 µs, enabling 80,000+ index scans per second.
+Go reads a T=1000 episode (~21 MB raw) in ~5 ms (4.1 GB/s, memory-bandwidth limited).
+Python reads in ~5.6 ms; writes in ~43 ms (no compression) or ~165 ms (zstd, 1.97× smaller).
+Header + index lookup alone takes ~8 µs in Go, and 9.8 µs per file in Python across
+1000 real episode files — 100,000+ index scans per second.
 
 Single-channel partial fetch from a 50 MB file:
-**WShard 101 µs vs NPZ 194 µs vs HDF5 255 µs.**
+**WShard 111 µs vs NPZ 175 µs vs HDF5 273 µs.**
 
 See [bench/](https://github.com/phenomenon0/wshard/tree/main/bench) for write/read benchmarks across compression types vs NumPy NPZ, HDF5, and Parquet.
 

@@ -8,7 +8,7 @@ WShard is the binary file format for trajectory data — episodes from robots, s
 
 For robotics engineers, RL researchers, and world model teams who collect, store, and train on sequential decision-making data, WShard is a binary episode format that replaces the patchwork of HDF5, NPZ, RLDS, and custom formats with a single cross-language file that handles multi-modal observations, per-block compression, streaming recording, and chunked episodes in one container.
 
-Unlike HDF5 (single-writer, no streaming, Python-centric), RLDS (TensorFlow lock-in, rigid schema), LeRobot Parquet+MP4 (publishing format, not training-time), or lab-specific custom formats (no interop), WShard is a flat binary with O(1) block lookup, crash-safe streaming append, and verified cross-language parity between Go, Python, and TypeScript.
+Unlike HDF5 (single-writer, no streaming, Python-centric), RLDS (TensorFlow lock-in, rigid schema), LeRobot Parquet+MP4 (publishing format, not training-time), or lab-specific custom formats (no interop), WShard is a flat binary with O(1) block lookup, live recording that publishes each episode atomically, and verified cross-language parity between Go, Python, and TypeScript.
 
 ---
 
@@ -26,7 +26,7 @@ There is no standard format. The current landscape:
 
 | Format | What It Gets Right | Where It Breaks |
 |--------|--------------------|-----------------|
-| HDF5 | Proven, handles large arrays | Single-writer lock. No streaming append. Corrupt on crash. Python-centric in practice. |
+| HDF5 | Proven, handles large arrays | Single-writer lock. Corrupt on crash without journaling. Python-centric in practice. |
 | NPZ (DreamerV3) | Simple, numpy-native | No metadata. No compression choice. No cross-language. No streaming. |
 | RLDS/TFDS | Google-backed, typed schema | TensorFlow dependency. Rigid schema. No streaming. |
 | Parquet + MP4 (LeRobot v3) | Good for publishing to HuggingFace Hub | Two files per episode. Poor training-time random access. No per-block compression. |
@@ -120,7 +120,7 @@ episode_42.wshard (1.8 MB)
 |---|---|---|---|---|---|
 | Episode-native semantics | Yes | No | Partial | Yes | No |
 | Per-block compression | Yes | Dataset-level | Format-level | No | Per-channel |
-| Streaming append | Yes (.partial) | No | No | No | Yes |
+| Atomic publish (.partial → rename) | Yes | No | No | No | No |
 | Cross-language | Go, Python, TS | Python (practical) | Python | Python (TF) | Many |
 | Zero-copy reads | Yes (mmap, aligned) | Partial | No | No | Yes |
 | Chunked episodes | Yes (manifest) | Manual | No | No | No |

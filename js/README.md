@@ -12,9 +12,15 @@ TypeScript implementation of the W-SHARD (World-Model Episode Shard) format for 
 
 ## Installation
 
+`@wshard/core` is not on the npm registry yet. Clone and build:
+
 ```bash
-npm install @wshard/core
+git clone https://github.com/phenomenon0/wshard.git
+cd wshard/js && npm ci && npm run build
 ```
+
+Then depend on it by path (`"@wshard/core": "file:../wshard/js"`) or import from
+`dist/` directly.
 
 ## Usage
 

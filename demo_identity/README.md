@@ -39,10 +39,11 @@ adds `../py` to `sys.path` itself.
 
 - **Hash canon**: the identity value is sha256 over *canonical JSON* of
   `{"v":1,"leaf":"sha256","entries":{name:sha256(uncompressed-bytes)}}` — never
-  raw bytes. Go hand-rolls the canon with `encoding/json` (sorted keys, HTML
-  escaping off); Python uses glyph-py `canon_json(from_json_loose(…))`. They
-  are byte-identical for this shape, in both directions (Go verifies
-  Python-written files and vice-versa).
+  raw bytes. Go writes the canon by hand in `go/shard/canonjson.go` — sorted
+  keys, RFC 8785 §3.2.2.2 escaping — rather than through `encoding/json`, which
+  escapes `<`, `>` and `&` and would diverge on any block name containing them;
+  Python uses glyph-py `canon_json(from_json_loose(…))`. They are byte-identical
+  in both directions (Go verifies Python-written files and vice-versa).
 - **Identity is per-container-content, not per-episode-logic across writers**:
   Go's `CreateWShard` and Python's `save_wshard` of the "same" episode produce
   different identity values, because Python emits a `time/ticks` block and
